@@ -1,0 +1,38 @@
+# ONT ligated-DNA selection-screen workflow.
+#
+#   raw fastqs -> nanocomp                 (cross-sample read QC; parallel branch, gates nothing)
+#   clean -> train_hmm -> pychopper -> decode -> featurecount -> {report_sample, report_cross}
+#
+# Run from the repo root (where pixi.toml lives):
+#   snakemake -n                 # dry-run: inspect the DAG
+#   snakemake --cores 18         # full run
+# See README.md for prerequisites (pixi envs + the one-time fix-preprocess-env patch).
+configfile: "config/config.yaml"
+
+
+include: "rules/common.smk"
+
+
+# `all` is defined before the rule modules so it is the default target.
+rule all:
+    input:
+        # cross-sample read QC on the raw fastqs (NanoComp — one combined report)
+        f"{OUTDIR}/qc/nanocomp/bysample_NanoComp-report.html",
+        # one interactive report per sample (experimental + the initial library)
+        [f"{stem(s)}.featurecount_report.html" for s in SAMPLES],
+        # the cross-sample comparison report
+        f"{OUTDIR}/decode/cross_sample_featurecount_report.html",
+        # summaries (parity with the legacy scripts)
+        f"{OUTDIR}/clean/clean_summary.tsv",
+        f"{OUTDIR}/preprocess/batch_summary.tsv",
+
+
+include: "rules/qc.smk"
+include: "rules/setup.smk"
+include: "rules/refs.smk"
+include: "rules/clean.smk"
+include: "rules/hmm.smk"
+include: "rules/preprocess.smk"
+include: "rules/decode.smk"
+include: "rules/featurecounts.smk"
+include: "rules/reports.smk"

@@ -1,0 +1,76 @@
+# =====================================================================================
+# Configuration for the ONT ligated-DNA selection-screen workflow.
+#
+# Every path/parameter the workflow needs lives here — the Snakefile and rules read
+# ONLY from this file, so the workflow is portable: point these at your data on any
+# machine (add `linux-64` to pixi.toml `platforms` first if you are not on aarch64).
+#
+# Paths may be absolute or relative to the workflow repo root (where you run snakemake).
+# =====================================================================================
+
+# Everything the workflow produces lands under this directory.
+outdir: results
+
+# ---- decontamination genomes (host/contaminant depletion in `clean`) ----------------
+# A read is KEPT only if it is unmapped to EVERY genome listed here (order doesn't change
+# the result). `clean` chains one `minimap2 | samtools fastq -f 4` depletion per genome,
+# then a single length filter. Each genome is a reusable global index: `mmi` (REQUIRED) is
+# the index path; if it's missing and `fasta` is given, build_index builds it there once
+# and reuses it (`if [ ! -f "$MMI" ]`-style). For one genome, use a one-element list.
+decontaminate:
+  - name: human
+    mmi:   /home/hongj/references/Genomes/Human/GRCh38.map-ont.mmi
+    fasta: /home/hongj/references/Genomes/Human/GRCh38.primary_assembly.genome.fa  # source; only used if mmi is missing (local path or https URL)
+  # - name: mouse                 # add more genomes to also deplete against them
+  #   mmi:   /home/hongj/references/Genomes/Mouse/GRCm39.map-ont.mmi
+  #   fasta: /home/hongj/references/Genomes/Mouse/GRCm39.fa
+index_preset: map-ont            # minimap2 -x preset for both build (-d) and align
+
+# ---- preprocessing resources (shipped in resources/, override per project) ----------
+adapters_fasta:   resources/adapters.fasta        # >Forward_Primer / >Backward_primer
+pychopper_config: resources/pychopper_config.txt  # primer-name config; names must match adapters
+
+# ---- LigandFrags2 decode tool (private repo — NOT cloned by the workflow) ------------
+# Provide EITHER a prebuilt `binary` OR `source` (a working tree already checked out to
+# the desired branch). If `binary` is null, `build_ligandfrags` compiles it with cargo.
+ligandfrags:
+  binary: null
+  source: /home/hongj/tools/LigatedDNA-main
+  manifest_subpath: Cargo.toml
+  bin_name: LigandFrags2
+
+# ---- decode inputs ------------------------------------------------------------------
+expected_sequences: /home/hongj/projects/cell/exp/Cell_uptake_expected_sequences_updated_260707.csv
+decode_format: parquet
+
+# ---- tunables (were env vars / hardcoded constants in the scripts) ------------------
+params:
+  minlen: 103        # clean: keep reads strictly longer than this (drop len <= minlen)
+  zmin:   104        # pychopper -z : min complete-molecule length for the construct
+  ntrain: 50000      # train_hmm subsample size (0 = train on the full initial library)
+
+# ---- per-rule thread counts (Snakemake -j caps total concurrency) -------------------
+threads:
+  clean:     18
+  pychopper: 18
+  decode:    8       # -> RAYON_NUM_THREADS for the Rust decoder
+
+# ---- reports ------------------------------------------------------------------------
+report:
+  r0_baseline: true  # wire the initial library as the shared R0 baseline in the cross report
+
+# ---- samples ------------------------------------------------------------------------
+# role: experimental | initial  (exactly one `initial`, used as the R0 baseline).
+# group = cell line, round = selection round. Names must be globally unique.
+samples:
+  - {name: A549_R1, group: A549, round: 1, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R1.fastq}
+  - {name: A549_R2, group: A549, round: 2, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R2.fastq}
+  - {name: A549_R3, group: A549, round: 3, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R3.fastq}
+  - {name: A549_R4, group: A549, round: 4, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R4.fastq}
+  - {name: A549_R5, group: A549, round: 5, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R5.fastq}
+  - {name: MDA_R1,  group: MDA,  round: 1, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R1.fastq}
+  - {name: MDA_R2,  group: MDA,  round: 2, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R2.fastq}
+  - {name: MDA_R3,  group: MDA,  round: 3, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R3.fastq}
+  - {name: MDA_R4,  group: MDA,  round: 4, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R4.fastq}
+  - {name: MDA_R5,  group: MDA,  round: 5, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R5.fastq}
+  - {name: 2026initial_library, group: initial, round: 0, role: initial, fastq: /home/hongj/projects/cell/rawdata/ONT/initial4A549_MDA/2026initial_library.fastq}

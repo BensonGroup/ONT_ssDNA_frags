@@ -1,0 +1,93 @@
+[workspace]
+name = "DNA nanostructure ONT preprocessing"
+version = "0.1.0"
+description = "Nanopore sequencing analysis workflow: length and genomic contamination filtering, full length classification, UMI extraction, fragment decoding"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-aarch64"]
+
+[dependencies]
+python = "3.12.*"
+
+# ---------------------------------------------------------------------------
+# Features (grouped by workflow stage). Combined into environments below.
+# ---------------------------------------------------------------------------
+
+# Quality control (PDF: "Quality Control for Nanopore")
+[feature.qc.dependencies]
+nanoplot = "*"
+multiqc = "*"
+chopper = "*"     # fast Rust read filtering (modern NanoFilt replacement)
+nanostat = ">=1.6.0,<2"
+nanocomp = ">=1.25.6,<2"
+cutadapt = ">=5.2,<6"
+seqkit = ">=2.13.0,<3"
+porechop_abi = ">=0.5.1,<0.6"
+
+# UMI extraction (PDF: "Running Extract_UMI.py" -> Bio.Align.PairwiseAligner)
+[feature.umi.dependencies]
+biopython = "*"
+pandas = "*"
+polars = "*"            # columnar engine for the Parquet frags store + per-read feature counts
+matplotlib-base = "*"   # feature-count report figures (no Qt backend needed)
+seaborn = "*"           # heatmaps / grouped bars in the feature-count report
+plotly = "*"            # interactive feature-count reports (build_featurecount_report[_cross].py)
+regex = ">=2026.6.28,<2027"
+
+# Read alignment / genome mapping (PDF: "Mapping to the Human Genome -> Minimap2")
+[feature.align.dependencies]
+minimap2 = "*"
+samtools = "*"
+bwa = ">=0.7.19,<0.8"
+
+# Consensus (PDF: "Consensus -> NGSpeciesID"). Heavy deps (medaka), kept isolated.
+# Binary tools come from conda. ngspeciesid + edlib come from PyPI because conda
+# has no linux-aarch64 build of edlib (a hard dep of conda's ngspeciesid).
+# Installing UPSTREAM ngspeciesid via pip pulls the correct Python dep closure
+# (edlib, parasail, ...); you then overlay your patched NGSpeciesID_LisaE
+# (which exposes `--l` SPOA alignment mode) on top. See SETUP_NOTES.md.
+[feature.consensus.dependencies]
+spoa = "*"
+racon = "*"
+medaka = "*"
+minimap2 = "*"
+samtools = "*"
+
+[feature.consensus.pypi-dependencies]
+NGSpeciesID = "*"
+
+# Preprocessing (pychopper phmm): orient + full-length-classify reads, retain
+# primers as UMI anchors. phmm backend trains construct-specific primer HMMs via
+# hammerpede (needs HMMER + SPOA). hammerpede has no conda package -> pip from git.
+# See workflow/plans/preprocessing.md.
+[feature.preprocess.dependencies]
+pychopper = "*"
+hmmer = "*"
+spoa = "*"
+
+[feature.preprocess.pypi-dependencies]
+hammerpede = { git = "https://github.com/nanoporetech/hammerpede.git" }
+
+# Two unmaintained upstreams need post-install patches to run on this env's
+# pandas/py3.12: hammerpede's removed-in-3.11 "rU" file mode, and pychopper's
+# float(<Series>) in the report-PDF step (pandas>=2 rejects it -> non-zero exit
+# even though all outputs are written). Both fixes are semantic no-ops; no
+# upstream/fork carries them, so we patch the installed sources. Run this ONCE
+# after every `pixi install`/clean that re-fetches these packages. Idempotent and
+# python-version-agnostic. See SETUP_NOTES.md and workflow/fix_preprocess_env.sh.
+[feature.preprocess.tasks]
+fix-preprocess-env = "bash $PIXI_PROJECT_ROOT/workflow/fix_preprocess_env.sh"
+
+# Toolchain to BUILD the Rust Ligand2Frags / LigandFrags2 binary from source.
+# Required because this host is aarch64 — an x86 binary copied from the "big
+# computer" will not run here. (PDF: "RUST/Ligand 2 Frags"). See SETUP_NOTES.md.
+[feature.build.dependencies]
+rust = "*"
+
+# ---------------------------------------------------------------------------
+# Environments
+# ---------------------------------------------------------------------------
+[environments]
+default = ["qc", "umi", "align"]
+preprocess = { features = ["preprocess"], no-default-feature = true }
+consensus = { features = ["consensus"], no-default-feature = true }
+build = { features = ["build"], no-default-feature = true }
