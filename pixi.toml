@@ -83,6 +83,13 @@ fix-preprocess-env = "bash $PIXI_PROJECT_ROOT/workflow/fix_preprocess_env.sh"
 [feature.build.dependencies]
 rust = "*"
 
+# Orchestrator. Snakemake sits ABOVE the per-rule envs, so it lives in its own
+# no-default-feature environment: pinned in pixi.lock, but with no solver
+# entanglement with the tool envs. The conda package is `snakemake-minimal`; the
+# binary is `snakemake`. Run it with `pixi run -e snakemake snakemake …`.
+[feature.snakemake.dependencies]
+snakemake-minimal = "*"
+
 # ---------------------------------------------------------------------------
 # Environments
 # ---------------------------------------------------------------------------
@@ -91,3 +98,4 @@ default = ["qc", "umi", "align"]
 preprocess = { features = ["preprocess"], no-default-feature = true }
 consensus = { features = ["consensus"], no-default-feature = true }
 build = { features = ["build"], no-default-feature = true }
+snakemake = { features = ["snakemake"], no-default-feature = true }

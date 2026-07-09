@@ -1,31 +1,37 @@
 # ONT ligated-DNA selection-screen workflow
 
-A Snakemake workflow for the Nanopore ligated-DNA selection screen: human depletion → primer-HMM
+A Snakemake workflow for the Nanopore ligated-DNA selection screen: genomic depletion → primer-HMM
 training → pychopper preprocessing → cONcat (new) decode → per-read feature counts → interactive
 HTML reports.
 
 ```
-clean ─┬─────────────► train_hmm ─┐
-       │                          ▼
-       └────────────────────────► pychopper ──► decode ──► featurecount ─┬─► report_sample
-                                                                         └─► report_cross
+minikow/dorado passed fastq ─┬─► genomic contamination─┐
+(zcat per sample)            └─► length filter         └─┬─► train_hmm ─┐
+                                                         │              ▼
+                                                         └────────────► pychopper ──► cONcat ──► featurecount ─┬─► report_sample
+                                                                                       (new)                   └─► report_cross
 ```
 
 Environments are managed by **pixi** (conda-forge + bioconda); orchestration is Snakemake.
 Snakemake is pure Python and architecture-independent — the same workflow runs on `linux-aarch64`
 and `linux-64`; only the tools it calls are per-arch (pixi re-solves; the Rust decoder recompiles).
 
-## Prerequisites (once per machine)
+## Set up envs
 
-1. Install [pixi](https://pixi.sh). If you are **not** on `linux-aarch64`, add your platform to
+Install [pixi](https://pixi.sh). If you are **not** on `linux-aarch64`, add your platform to
    `pixi.toml` first, e.g. `platforms = ["linux-aarch64", "linux-64"]`.
-2. Create the environments the rules call:
+
+Then in this repo root: 
+
+1. Create the environments the rules call:
+
    ```bash
    pixi install -e default      # minimap2, samtools, seqkit, polars, plotly (clean + featurecount + reports)
    pixi install -e preprocess   # pychopper, hmmer, hammerpede         (train_hmm + pychopper)
    pixi install -e build        # rust/cargo                            (only if building LigandFrags2 from source)
    ```
-3. Patch the `preprocess` env (idempotent; **re-run after every `pixi install`/clean** of that env):
+2. Patch the `preprocess` env (idempotent; **re-run after every `pixi install`/clean** of that env):
+
    ```bash
    pixi run -e preprocess fix-preprocess-env
    ```
@@ -34,12 +40,39 @@ and `linux-64`; only the tools it calls are per-arch (pixi re-solves; the Rust d
    otherwise make successful jobs exit non-zero *after* writing outputs — which would make Snakemake
    delete them. The workflow also runs this via the `fix_preprocess_env` rule (a `.preprocess_patched`
    sentinel that `train_hmm`/`pychopper` depend on), but the env must already be installed.
-4. Install Snakemake (e.g. `pipx install snakemake`, or its own pixi/conda env).
+3. **Snakemake is the orchestrator, in its own isolated env.** It sits *above* the per-rule
+   envs, so it lives in a `no-default-feature` `snakemake` environment — pinned in `pixi.lock`,
+   with no solver entanglement with the tool envs (the conda package is `snakemake-minimal`, but
+   the binary is `snakemake`):
 
-## Configure
+   ```bash
+   pixi install -e snakemake
+   alias concatsmk='pixi run -e snakemake snakemake'   # convenience prefix, once per shell
+   concatsmk --version
+   ```
 
-Edit `config/config.yaml`. Everything is config-driven — point the paths at your data:
+## Your project directory and config
 
+Create four folders in your project dir (outside of this repo):
+
+```
+.
+|-- config
+|   `-- config_cell_preprint.yaml (your config.yaml)
+|-- exp
+|   `-- expected_seq.csv (your expected sequences)
+|-- rawdata (your .fastq, one subdir per sample)
+|   |-- HEK293
+|   |-- initial
+|   `-- RAW
+|-- resources (your primers and fwd/bwd config)
+|   |-- adapters.fasta
+|   `-- pychopper_config.txt
+```
+
+Edit `config/config.yaml`. Point the paths at your data:
+
+- **outdir** - abs path to your output dir, likely your project dir/results
 - **reference** — a prebuilt minimap2 `mmi`, **or** a `fasta` (local path or `https://` URL) that the
   `build_index` rule downloads + indexes.
 - **ligandfrags** — a prebuilt `binary`, **or** `source` (a working tree already checked out to the
@@ -53,31 +86,18 @@ Edit `config/config.yaml`. Everything is config-driven — point the paths at yo
   ```
 - **adapters_fasta / pychopper_config / expected_sequences** — per-project; defaults ship in
   `resources/`. The primer HMM is *built each run* from the adapters + the initial-library sample.
-- **samples** — the sample table. Exactly one sample has `role: initial` (the R0 baseline); the rest
-  are `role: experimental`.
+- **samples** — the sample table. Exactly one sample has `role: initial` (the R0 baseline). See example in this repo config/config.yaml
 
-## Run (from the repo root, where `pixi.toml` lives)
+## Run (from the repo root)
+
+Using the `concatsmk` alias from prerequisites step 4 (or the full `pixi run -e snakemake snakemake` prefix):
 
 ```bash
-snakemake -n --printshellcmds --configfile /abs/path/to/your_config.yaml          # dry-run: inspect the DAG without executing
-snakemake --cores 18 --configfile /abs/path/to/your_config.yaml                   # full run
-snakemake --cores 18 <target>          # build one target, e.g. a single sample report:
-#   snakemake --cores 8 results/decode/A549_R1/A549_R1.featurecount_report.html
-snakemake check_all --cores 4          # optional: validate every featurecount against its raw parquet
+concatsmk -n --printshellcmds --configfile /abs/path/to/your_config.yaml         # dry-run: inspect the DAG without executing
+concatsmk --cores 18 --configfile /abs/path/to/your_config.yaml                # full run (reads config/config.yaml by default)
+concatsmk --cores 8 /abs/path/to/results/decode/your.featurecount_report.html   # build one target
+concatsmk check_all --cores 4        # optional: validate every featurecount against its raw parquet
 ```
-
-Three things to know:
-
-- **It merges over the default, doesn't replace it.** The Snakefile loads `config/config.yaml`
-  first, then deep-merges your `--configfile` on top. Top-level scalars and *lists* (`samples`,
-  `decontaminate`) are replaced by yours; *nested dicts* (`params`, `threads`, `report`,
-  `ligandfrags`) merge key-by-key, so any sub-key you omit silently inherits the default — define
-  those blocks fully in your config.
-- **Relative paths resolve against the working dir, not the config's location.** `outdir: results`
-  writes to `./results` in the repo root wherever the config lives, so keep input/resource paths
-  **absolute** in an external config. Use `--directory /path` (or set an absolute `outdir`) to put
-  outputs elsewhere.
-- Scripts and envs are located via the Snakefile itself, so nothing else changes.
 
 ## Outputs (under `config.outdir`, default `results/`)
 
