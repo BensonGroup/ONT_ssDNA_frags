@@ -66,6 +66,10 @@ def load():
 
     summ = pl.read_csv(SUMM, separator="\t").to_dicts()[0]
     n_reads = int(summ["n_reads"])
+    # A sample can decode to zero reads (e.g. every read dropped as missing_anchor). The
+    # per-read rates are then undefined; `denom` keeps them finite and the aggregates below
+    # are empty anyway, so every rate comes out 0.
+    denom = n_reads or 1
 
     fc = pl.scan_parquet(FC)
     # Per-feature, strand-collapsed (fwd + _rc merged; reads counted once via n_unique).
@@ -93,8 +97,8 @@ def load():
             "base": b, "is_anchor": b in anchors,
             "class": "anchor" if b in anchors else cls, "length": length,
             "total": int(r["total"]), "n_reads_with": int(r["n_reads_with"]),
-            "mean_copies": r["total"] / n_reads,
-            "pct_reads": 100.0 * r["n_reads_with"] / n_reads,
+            "mean_copies": r["total"] / denom,
+            "pct_reads": 100.0 * r["n_reads_with"] / denom,
             "ed_median": r["ed_median"],
         }
 
@@ -278,9 +282,10 @@ def stat_tiles(d):
     s = d["summ"]
     n = d["n_reads"]
     wp = int(s["n_reads_with_payload"])
+    carry = f"{100*wp/n:.1f}% carry ≥1 ligand fragment" if n else "no reads decoded"
     tiles = [
         ("reads decoded", f"{n:,}", "≥1 UMI-anchored, fused"),
-        ("with a payload", f"{wp:,}", f"{100*wp/n:.1f}% carry ≥1 ligand fragment"),
+        ("with a payload", f"{wp:,}", carry),
         ("payload calls", f"{int(s['n_payload_rows']):,}", "ligand-fragment detections"),
         ("payload features", f"{int(s['n_payload_features'])}", "distinct incl. _rc orientation"),
         ("copies / read", f"{s['mean_payload_copies_per_read']:.2f}", "payload calls ÷ reads"),
@@ -357,6 +362,22 @@ THEME_BTN = ('<button class=themebtn onclick="(function(){var d=document.documen
              "&#9680; theme</button>")
 
 
+def zero_note(d):
+    """Banner for a sample the decoder fused no reads for: say so, and say why."""
+    p = d["prov"]
+    bits = []
+    if p.get("dropped"):
+        bits.append(f"all <code>{p['dropped']:,}</code> reads were dropped")
+    if p.get("missing_anchor"):
+        bits.append(f"<code>{p['missing_anchor']:,}</code> for a missing UMI anchor")
+    if p.get("strand_conflict"):
+        bits.append(f"<code>{p['strand_conflict']:,}</code> for a strand conflict")
+    why = (" — " + ", ".join(bits)) if bits else ""
+    return ('<div class="callout note"><p><b>No reads decoded.</b> The decoder fused 0 reads for '
+            f"this sample{why}. There are no feature counts to plot, so the figures and the "
+            "per-feature table are omitted; every count below is zero.</p></div>")
+
+
 def main():
     d = load()
     n_payload_feats = int(d["summ"]["n_payload_features"])
@@ -370,7 +391,7 @@ def main():
                        + ", ".join(f"<code>{esc(b)}</code>" for b in d["absent"])
                        + " — present in the expected-sequences set but with zero calls here.</p></div>")
 
-    H = [
+    head = [
         "<!doctype html>", "<html lang=en>", "<head>", "<meta charset=utf-8>",
         '<meta name=viewport content="width=device-width,initial-scale=1">', THEME_INIT,
         f"<title>Ligand fragment feature counts — {esc(STEM.name)}</title>",
@@ -382,7 +403,17 @@ def main():
         "the calls. Charts are interactive — hover for exact numbers, click legend entries to "
         "toggle classes, drag to zoom.</p>",
         provenance(d),
+    ]
 
+    # Zero decoded reads is a legitimate outcome, not an error: emit a small, honest report
+    # (the figures would all be empty and the whole expected set would list as "unseen").
+    if d["n_reads"] == 0:
+        H = head + [zero_note(d), stat_tiles(d), "</body>", "</html>"]
+        OUT.write_text("\n".join(x for x in H if x))
+        print(f"wrote {OUT}  (no reads decoded)")
+        return
+
+    H = head + [
         '<div class="callout aim"><p><b>Aim.</b> For every ligand fragment, how many copies does '
         "an average decoded read carry (<b>mean copies / read</b> = total calls ÷ reads decoded)? "
         "Everything is <b>strand-collapsed</b> (a feature and its <code>_rc</code> are one row) and "
