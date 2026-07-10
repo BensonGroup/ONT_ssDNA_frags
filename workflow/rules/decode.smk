@@ -5,9 +5,12 @@
 # still recovers the per-sample expected CSV. RAYON handles per-process threading; Snakemake -j
 # replaces the old JOBS/xargs fan-out, and the DAG replaces the "skip if exists" guard.
 #
-# Declared outputs are the ones consumed downstream (fragments/umis/log) plus fused_reads.fq
-# (used opportunistically by the cross-report coverage panel). The decoder also writes
-# fused.parquet / trimmed.parquet / truncated.fq alongside; those are untracked.
+# Declared outputs are the ones consumed downstream: fragments/umis/log, fused_reads.fq (used
+# opportunistically by the cross-report coverage panel), and fused/trimmed.parquet (required by
+# `rule dedup`). The decoder also writes truncated.fq alongside; it stays UNDECLARED because
+# umi_dedup.py treats it as optional and nothing guarantees the decoder emits it for a sample with
+# zero truncated reads — a declared-but-absent output would raise MissingOutputException and take
+# this rule's *valid* outputs down with it.
 rule decode:
     input:
         fq=f"{OUTDIR}/preprocess/{{sample}}/{{sample}}.full_length.fq",
@@ -16,8 +19,16 @@ rule decode:
     output:
         frags=f"{OUTDIR}/{{decbase}}/{{sample}}/{{sample}}.fragments.parquet",
         umis=f"{OUTDIR}/{{decbase}}/{{sample}}/{{sample}}.umis.parquet",
+        fused=f"{OUTDIR}/{{decbase}}/{{sample}}/{{sample}}.fused.parquet",
+        trimmed=f"{OUTDIR}/{{decbase}}/{{sample}}/{{sample}}.trimmed.parquet",
         fused_reads=f"{OUTDIR}/{{decbase}}/{{sample}}/{{sample}}.fused_reads.fq",
         log=f"{OUTDIR}/{{decbase}}/{{sample}}/{{sample}}.ligateddna.log",
+    wildcard_constraints:
+        # The decoder owns ONLY the raw trees. The shared `decbase` constraint in common.smk is
+        # wide enough to cover dedup/ so that featurecount/report_sample can serve either tree;
+        # without this per-rule narrowing, `decode` would also match dedup/<s>/<s>.fragments.parquet
+        # and collide with `rule dedup`.
+        decbase="decode|decode_initial",
     threads: config["threads"]["decode"]
     params:
         stem=lambda wc: f"{OUTDIR}/{wc.decbase}/{wc.sample}/{wc.sample}",

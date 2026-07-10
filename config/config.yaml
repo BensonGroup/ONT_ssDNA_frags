@@ -49,11 +49,25 @@ params:
   zmin:   104        # pychopper -z : min complete-molecule length for the construct
   ntrain: 50000      # train_hmm subsample size (0 = train on the full initial library)
 
+# ---- UMI deduplication (decode -> dedup -> featurecount) ----------------------------
+# Drops garbage UMIs, then collapses the survivors into molecules with
+# `starcode -d 1 -s` (spheres, Levenshtein distance 1), keeping one representative read
+# per cluster (highest whole-read base-quality sum). The raw `decode/` tree is ALWAYS
+# built -- it feeds this stage -- so `enabled: false` only decides which tree the
+# featurecounts and reports are built from, and reproduces the pre-dedup results.
+umi_dedup:
+  enabled: true          # false -> reports come from decode/ ; DAG identical to pre-dedup
+  max_homopolymer: 8     # drop a UMI whose longest homopolymer run is >= this
+  max_base_frac:   0.7   # drop a UMI where any single base's fraction is >= this
+  # The UMI-length window (10..12 per UMI) is a constant in workflow/scripts/umi_filter_lib.py,
+  # not a CLI flag on umi_dedup.py, so it is deliberately not exposed here.
+
 # ---- per-rule thread counts (Snakemake -j caps total concurrency) -------------------
 threads:
   clean:     18
   pychopper: 18
   decode:    8       # -> RAYON_NUM_THREADS for the Rust decoder
+  dedup:     8       # recorded in provenance only; starcode is pinned to -t 1 (reproducibility)
 
 # ---- reports ------------------------------------------------------------------------
 report:

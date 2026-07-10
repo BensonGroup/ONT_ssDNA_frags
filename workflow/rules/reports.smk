@@ -26,7 +26,7 @@ rule report_sample:
 # One row per non-initial sample; `idx` is config order so groups appear as configured.
 rule cross_sample_metadata:
     output:
-        f"{OUTDIR}/decode/sample_metadata.tsv",
+        f"{OUTDIR}/{{crossbase}}/sample_metadata.tsv",
     params:
         rows=[(n, str(SAMPLE[n].get("group", "") or ""), SAMPLE[n].get("round"), i)
               for i, n in enumerate(SAMPLES) if SAMPLE[n]["role"] != "initial"],
@@ -39,36 +39,40 @@ rule cross_sample_metadata:
 
 
 def cross_inputs(wildcards):
-    """Every non-initial sample's decode artifacts, plus the initial library's when the R0
-    baseline is enabled. The cross script globs L2F_BASE=decode/*/ and groups the samples it
-    finds by config `group`; declaring every non-initial sample here keeps that glob and the
-    DAG in sync (previously only `experimental` samples were declared, which raced). The
-    baseline is injected separately via L2F_R0_STEM."""
+    """Every non-initial sample's artifacts in the requested tree, plus the initial library's when
+    the R0 baseline is enabled. The cross script globs L2F_BASE=<crossbase>/*/ (directories only)
+    and groups the samples it finds by config `group`; declaring every non-initial sample here
+    keeps that glob and the DAG in sync (previously only `experimental` samples were declared,
+    which raced). The baseline lives in the sibling `<crossbase>_initial/` tree — never globbed —
+    and is injected separately via L2F_R0_STEM, so the two always move in lockstep."""
+    base = wildcards.crossbase
     parts = [".featurecount.parquet", ".featurecount.summary.tsv", ".umis.parquet",
              ".ligateddna.log", ".fragments.parquet"]
     files = []
     for s in NONINITIAL:
-        st = f"{OUTDIR}/decode/{s}/{s}"
+        st = f"{OUTDIR}/{base}/{s}/{s}"
         files += [st + p for p in parts]
     if config["report"]["r0_baseline"]:
-        st = f"{OUTDIR}/decode_initial/{INITIAL}/{INITIAL}"
+        st = f"{OUTDIR}/{base}_initial/{INITIAL}/{INITIAL}"
         files += [st + p for p in parts]
     return files
 
 
 # Cross-sample comparison report. L2F_R0_STEM="" disables the R0 baseline in the script;
-# L2F_SAMPLES points the script at the config-derived grouping metadata.
+# L2F_SAMPLES points the script at the config-derived grouping metadata. Parameterized by
+# {crossbase} so the same rule serves the raw decode tree and the deduplicated one; `rule all`
+# requests CROSSBASE (see common.smk).
 rule report_cross:
     input:
         cross_inputs,
-        meta=f"{OUTDIR}/decode/sample_metadata.tsv",
+        meta=f"{OUTDIR}/{{crossbase}}/sample_metadata.tsv",
         expected=config["expected_sequences"],
     output:
-        f"{OUTDIR}/decode/cross_sample_featurecount_report.html",
+        f"{OUTDIR}/{{crossbase}}/cross_sample_featurecount_report.html",
     params:
-        base=os.path.abspath(f"{OUTDIR}/decode"),
-        r0=(os.path.abspath(f"{OUTDIR}/decode_initial/{INITIAL}/{INITIAL}")
-            if config["report"]["r0_baseline"] else ""),
+        base=lambda wc: os.path.abspath(f"{OUTDIR}/{wc.crossbase}"),
+        r0=lambda wc: (os.path.abspath(f"{OUTDIR}/{wc.crossbase}_initial/{INITIAL}/{INITIAL}")
+                       if config["report"]["r0_baseline"] else ""),
         script=str(SCRIPTS / "build_featurecount_report_cross.py"),
     shell:
         r"""

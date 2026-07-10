@@ -23,7 +23,7 @@ cutadapt = ">=5.2,<6"
 seqkit = ">=2.13.0,<3"
 porechop_abi = ">=0.5.1,<0.6"
 
-# UMI extraction (PDF: "Running Extract_UMI.py" -> Bio.Align.PairwiseAligner)
+# UMI extraction (PDF: "Running Extract_UMI.py" -> Bio.Align.PairwiseAligner) + UMI dedup.
 [feature.umi.dependencies]
 biopython = "*"
 pandas = "*"
@@ -32,6 +32,7 @@ matplotlib-base = "*"   # feature-count report figures (no Qt backend needed)
 seaborn = "*"           # heatmaps / grouped bars in the feature-count report
 plotly = "*"            # interactive feature-count reports (build_featurecount_report[_cross].py)
 regex = ">=2026.6.28,<2027"
+starcode = ">=1.4,<2"   # exact Levenshtein-d1 UMI clustering (dedup rule); bioconda has aarch64
 
 # Read alignment / genome mapping (PDF: "Mapping to the Human Genome -> Minimap2")
 [feature.align.dependencies]

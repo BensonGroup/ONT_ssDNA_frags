@@ -33,6 +33,7 @@ rule featurecount_check:
         """
 
 
+# Validates whatever `rule all` built (the dedup tree when dedup is enabled, else decode).
 rule check_all:
     input:
-        [f"{stem(s)}.featurecount.check.txt" for s in SAMPLES],
+        [f"{report_stem(s)}.featurecount.check.txt" for s in SAMPLES],

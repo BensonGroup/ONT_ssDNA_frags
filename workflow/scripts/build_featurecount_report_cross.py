@@ -285,6 +285,20 @@ def group_spans(samples):
     return [(g, a, b) for g, a, b in spans]
 
 
+def group_band(fig, samples, yshift):
+    """One group name centred above each contiguous block of that group's columns.
+
+    Rotated -45°, the same reading direction as the column tick labels below it. A block can be a
+    single column wide — with no sample metadata the groups tie on rank and interleave — and at
+    that pitch horizontal names overlap: clearing them needs pitch > label width (~40px), whereas
+    rotated ones only need pitch·sin45 > label height (~14px). Rotation makes a label ~0.7·(width
+    + height) tall, so every caller reserves extra top margin for it."""
+    for g, a, b in group_spans(samples):
+        fig.add_annotation(x=(a + b) / 2, y=1.0, xref="x", yref="paper", yshift=yshift,
+                           xanchor="center", yanchor="bottom", textangle=-45,
+                           showarrow=False, text=f"<b>{esc(g)}</b>", font=dict(size=11))
+
+
 def col_label(s):
     """Full label (group + round) — used in hovers and the line-plot legends."""
     if s.get("is_baseline"):
@@ -344,15 +358,11 @@ def fig_heatmap(d):
             fig.add_vline(x=x, line_color=GREY, line_width=2, row=1, col=col)
         fig.update_xaxes(tickmode="array", tickvals=xpos, ticktext=xs,
                          tickangle=-40, tickfont=dict(size=10), side="top", row=1, col=col)
-    # group-name band above the forward panel's per-column round labels (the grouping layer);
-    # written once per group, centred over that group's block of columns
-    for g, a, b in group_spans(samples):
-        fig.add_annotation(x=(a + b) / 2, y=1.0, xref="x", yref="paper", yshift=34,
-                           yanchor="bottom", showarrow=False, text=f"<b>{esc(g)}</b>",
-                           font=dict(size=11))
+    # group-name band above the forward panel's per-column round labels (the grouping layer)
+    group_band(fig, samples, yshift=34)
     # lift the orientation subplot titles clear above the group band (topmost layer)
-    fig.update_annotations(yshift=64, selector={"text": "forward orientation"})
-    fig.update_annotations(yshift=64, selector={"text": "reverse-complement (_rc)"})
+    fig.update_annotations(yshift=96, selector={"text": "forward orientation"})
+    fig.update_annotations(yshift=96, selector={"text": "reverse-complement (_rc)"})
     style(fig, height=max(520, 15 * len(bases) + 130))
     # Colour stays log-transformed, but the colorbar ticks show REAL copies/read at each decade
     # (0.00001, 0.001, 0.1, 1 ...) so no "log10" mental step is needed; hence no colorbar title.
@@ -365,7 +375,7 @@ def fig_heatmap(d):
         val = 10.0 ** v
         return f"{val:.0f}" if v >= 0 else f"{val:.{-v}f}"
 
-    fig.update_layout(margin=dict(t=120),
+    fig.update_layout(margin=dict(t=152),
                       coloraxis=dict(colorscale="Viridis", cmin=lo, cmax=hi,
                                      colorbar=dict(tickvals=tickvals,
                                                    ticktext=[fmt(v) for v in tickvals],
@@ -391,14 +401,11 @@ def fig_class_composition(d):
     fig.update_layout(barmode="stack")
     for x in line_boundaries(samples):
         fig.add_vline(x=x, line_color=GREY, line_width=2)
-    for g, a, b in group_spans(samples):
-        fig.add_annotation(x=(a + b) / 2, y=1.0, xref="x", yref="paper", yshift=16,
-                           yanchor="bottom", showarrow=False, text=f"<b>{esc(g)}</b>",
-                           font=dict(size=11))
+    group_band(fig, samples, yshift=16)
     fig.update_xaxes(tickmode="array", tickvals=xpos, ticktext=xshort, tickangle=-40)
     fig.update_yaxes(title="% of payload calls", range=[0, 100])
     style(fig, height=420)
-    fig.update_layout(margin=dict(t=56))      # room for the group band above the bars
+    fig.update_layout(margin=dict(t=88))      # room for the rotated group band above the bars
     return fig_html(fig)
 
 
@@ -465,14 +472,11 @@ def fig_enrichment(d):
             fig.add_hline(y=i - 0.5, line_color="rgba(139,148,158,0.5)", line_width=1)
     for x in line_boundaries(samples_c):
         fig.add_vline(x=x, line_color=GREY, line_width=2)
-    for g, a, b in group_spans(samples_c):
-        fig.add_annotation(x=(a + b) / 2, y=1.0, xref="x", yref="paper", yshift=36,
-                           yanchor="bottom", showarrow=False, text=f"<b>{esc(g)}</b>",
-                           font=dict(size=11))
+    group_band(fig, samples_c, yshift=36)
     fig.update_xaxes(tickmode="array", tickvals=xpos, ticktext=xs, side="top",
                      tickangle=-40, tickfont=dict(size=10))
     style(fig, height=max(520, 15 * len(bases) + 120))
-    fig.update_layout(margin=dict(t=95))
+    fig.update_layout(margin=dict(t=127))
     return fig_html(fig)
 
 
@@ -594,6 +598,42 @@ def fig_quality(d):
     return fig_html(fig)
 
 
+def fig_depth(d):
+    """Absolute sequencing depth per sample: reads decoded, and the payload-bearing subset.
+
+    The other quality panels are all normalised per sample, so this is the only place the raw
+    depth shows. Both series carry the sample's own colour (shared with the coverage plot beside
+    it) and are told apart by opacity, not hue."""
+    cols = sample_palette(d)
+    samples = d["samples"]
+    xpos = list(range(len(samples)))          # numeric x so duplicate round labels never merge bars
+    xshort = [col_short(s) for s in samples]
+    xfull = [col_label(s) for s in samples]
+    bar = [cols[s["name"]] for s in samples]
+    n_reads = [int(d["meta"][s["name"]]["n_reads"]) for s in samples]
+    n_pay = [int(d["meta"][s["name"]]["n_reads_with_payload"]) for s in samples]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=xpos, y=n_reads, name="reads decoded", customdata=xfull,
+                         marker=dict(color=bar, opacity=0.42),
+                         hovertemplate="%{customdata}<br>reads decoded %{y:,}<extra></extra>"))
+    fig.add_trace(go.Bar(x=xpos, y=n_pay, name="with payload", customdata=xfull,
+                         marker=dict(color=bar),
+                         hovertemplate="%{customdata}<br>with &ge;1 payload frag "
+                                       "%{y:,}<extra></extra>"))
+    # a legend swatch can't stand for a per-bar colour list, and the coverage plot beside this one
+    # already legends the sample colours -- the two series are named in the hover and the caption.
+    fig.update_layout(barmode="group", bargap=0.25, bargroupgap=0.05, showlegend=False)
+    for x in line_boundaries(samples):
+        fig.add_vline(x=x, line_color=GREY, line_width=2)
+    group_band(fig, samples, yshift=16)
+    fig.update_xaxes(tickmode="array", tickvals=xpos, ticktext=xshort, tickangle=-40)
+    fig.update_yaxes(title="reads", tickformat="~s")
+    style(fig, height=380)
+    fig.update_layout(margin=dict(t=88))      # room for the rotated group band above the bars
+    return fig_html(fig)
+
+
 def fig_coverage(d):
     """Per-read coverage = expected-fragment bases ÷ post-trim read length; distribution per sample."""
     cols = sample_palette(d)
@@ -609,9 +649,12 @@ def fig_coverage(d):
             x=centers, y=ys, mode="lines", name=col_label(s), legendgroup=s["line"],
             line=dict(width=1.8, color=cols[nm]),
             hovertemplate=f"{col_label(s)}<br>~%{{x:.0f}}% covered<br>%{{y:.1f}}% of reads<extra></extra>"))
-    fig.update_xaxes(title="% of read length covered by expected fragments", range=[0, 100])
+    # x starts at 60: under 0.2% of any sample's reads fall below that, and the clip gives the
+    # informative 60-100 region ~2.5x the width.
+    fig.update_xaxes(title="% of read length covered by expected fragments", range=[60, 100])
     fig.update_yaxes(title="% of reads")
     style(fig, height=380)
+    fig.update_layout(margin=dict(t=88))      # match fig_depth's top margin so the plots align
     missing = [s["name"] for s in d["samples"] if not d["cov"].get(s["name"])]
     return fig_html(fig), missing
 
@@ -691,10 +734,16 @@ def main():
         "decodes themselves.</p></div>",
 
         "<h2>Quality</h2>",
-        "<p><b>Coverage.</b> Fraction of each read's length (post-trim, from "
+        "<p><b>Depth</b> (left): reads decoded per sample (pale) and the subset carrying at least "
+        "one payload fragment (solid) — the absolute scale that every other panel here normalises "
+        "away. <b>Coverage</b> (right): fraction of each read's length (post-trim, from "
         "<code>fused_reads.fq</code>) that is covered by expected-sequence fragments — how "
-        "completely the panel explains a read. Shown as the distribution of reads per sample.</p>",
-        cov_html,
+        "completely the panel explains a read, as the distribution of reads per sample. The "
+        "coverage axis starts at 60% because fewer than 0.2% of reads fall below it.</p>",
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start">',
+        f'<div style="min-width:0">{fig_depth(d)}</div>',
+        f'<div style="min-width:0">{cov_html}</div>',
+        "</div>",
         cov_note,
         "<p>Left: how many payload fragment copies a read carries (0 = amplification loop-only "
         "reads), as % of each sample's reads. Right: edit-distance of payload calls against the "
