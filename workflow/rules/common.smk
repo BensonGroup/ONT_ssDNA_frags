@@ -92,6 +92,16 @@ def _cfg_float(v, default, *, key, lo=None, hi=None):
     return _cfg_num(v, default, key=key, cast=float, lo=lo, hi=hi)
 
 
+def _cfg_choice(v, default, *, key, choices):
+    """Return v lower-cased if it is one of `choices`; `default` when v is None; else raise."""
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in choices:
+        return s
+    raise ValueError(f"config.{key}: {v!r} is not one of {sorted(choices)}")
+
+
 wildcard_constraints:
     sample="|".join(re.escape(s) for s in SAMPLES),
     # featurecount / featurecount_check / report_sample serve BOTH the raw decode trees and the
@@ -100,6 +110,7 @@ wildcard_constraints:
     # constraints. Otherwise decode would also match a dedup/ path -> AmbiguousRuleException.
     decbase="decode|decode_initial|dedup|dedup_initial",
     dedbase="dedup|dedup_initial",                   # the tree `rule dedup` writes into
+    umibase="umi|umi_initial",                       # the tree `rule umi_correct` writes into
     crossbase="decode|dedup",                        # which tree report_cross is built over
     k="|".join(str(i) for i in range(N_GENOMES)),   # depletion stage index
 
@@ -121,40 +132,69 @@ def stem(s):
     return f"{OUTDIR}/{decbase(s)}/{s}/{s}"
 
 
-# ---- UMI dedup tree (a sibling of the decode tree; see rules/dedup.smk) --------------
-# Read the config block defensively: projects keep their own config OUTSIDE this repo (see the
-# README), so a pre-existing config has no `umi_dedup:` key. Dedup is ON by default and the two
-# thresholds fall back to the umi_filter_lib constants rather than raising KeyError.
-UMI_DEDUP = config.get("umi_dedup", {}) or {}
-DEDUP_ON = _cfg_bool(UMI_DEDUP.get("enabled"), True, key="umi_dedup.enabled")
-DEDUP_MAX_HOMOPOLYMER = _cfg_int(UMI_DEDUP.get("max_homopolymer"), 8,
-                                 key="umi_dedup.max_homopolymer", lo=1)
-DEDUP_MAX_BASE_FRAC = _cfg_float(UMI_DEDUP.get("max_base_frac"), 0.7,
-                                 key="umi_dedup.max_base_frac", lo=0.0, hi=1.0)
+# ---- UMI stage: QC-filter (always) + optional ed<=1 correction / collapse ------------
+# `umi.mode` selects the behaviour (default `correct`); read defensively (a project config may lack
+# the `umi:` key). The processed `dedup/` tree (filtered, or collapsed in `dedup` mode) ALWAYS feeds
+# featurecount/reports -- correction never changes fragment counts. Thresholds fall back to the
+# umi_filter_lib constants rather than raising KeyError.
+UMI = config.get("umi", {}) or {}
+UMI_MODE = _cfg_choice(UMI.get("mode"), "correct", key="umi.mode",
+                       choices=("filter", "correct", "dedup"))
+DEDUP_ON = UMI_MODE == "dedup"            # collapse to one representative read per molecule
+UMI_CORRECT_ON = UMI_MODE == "correct"    # run the separate umi/ correction + characterisation branch
+UMI_STAGE_ON = True                       # the dedup/ tree (filter or collapse) always feeds featurecount
+DEDUP_MAX_HOMOPOLYMER = _cfg_int(UMI.get("max_homopolymer"), 8, key="umi.max_homopolymer", lo=1)
+DEDUP_MAX_BASE_FRAC = _cfg_float(UMI.get("max_base_frac"), 0.7,
+                                 key="umi.max_base_frac", lo=0.0, hi=1.0)
 DEDUP_THREADS = _cfg_int(config["threads"].get("dedup"), 8, key="threads.dedup", lo=1)
 
 
 def dedbase(s):
-    """Which dedup tree a sample lands in. Mirrors decbase(): the initial library is kept in its
-    own tree so report_cross's `<crossbase>/*/` directory glob never sees it as both a column and
+    """Which filtered/collapsed tree a sample lands in. Mirrors decbase(): the initial library is
+    kept in its own tree so report_cross's `<crossbase>/*/` glob never sees it as both a column and
     the R0 baseline."""
     return "dedup_initial" if SAMPLE[s]["role"] == "initial" else "dedup"
 
 
 def dedup_stem(s):
-    """Dedup output stem for a sample, e.g. results/dedup/A549_R1/A549_R1."""
+    """Filtered/collapsed output stem for a sample, e.g. results/dedup/A549_R1/A549_R1."""
     return f"{OUTDIR}/{dedbase(s)}/{s}/{s}"
 
 
 def report_stem(s):
-    """The stem whose featurecounts / per-sample report `rule all` builds: the dedup tree when
-    dedup is enabled, else the raw decode tree."""
-    return dedup_stem(s) if DEDUP_ON else stem(s)
+    """The stem whose featurecounts / per-sample report `rule all` builds: the processed dedup/
+    tree (the UMI stage always filters), so correction never changes fragment counts."""
+    return dedup_stem(s) if UMI_STAGE_ON else stem(s)
 
 
-# Base tree for the cross-sample report (report_cross is parameterized by {crossbase}); its R0
-# baseline is derived as f"{CROSSBASE}_initial", so the two move in lockstep.
-CROSSBASE = "dedup" if DEDUP_ON else "decode"
+# Base tree for the cross-sample FRAGMENT report (report_cross is parameterized by {crossbase}); its
+# R0 baseline is derived as f"{CROSSBASE}_initial", so the two move in lockstep.
+CROSSBASE = "dedup" if UMI_STAGE_ON else "decode"
+
+
+# ---- UMI correction branch (`umi/` tree, sibling of decode/dedup; see rules/umi.smk) -------------
+# Produced only when UMI_CORRECT_ON. Keeps every kept read but relabels its fused UMI to the abundant
+# ed<=1 centroid and records the per-molecule read count. The initial library is kept in its own
+# `umi_initial/` tree so the cross-sample glob never double-counts it.
+def umibase(s):
+    return "umi_initial" if SAMPLE[s]["role"] == "initial" else "umi"
+
+
+def umi_stem(s):
+    """UMI-correction output stem, e.g. results/umi/A549_R1/A549_R1."""
+    return f"{OUTDIR}/{umibase(s)}/{s}/{s}"
+
+
+# Experimental groups (config `group`, in config order). Each group gets ONE UMI x sample matrix
+# whose column order is the initial library (R0 baseline) first, then that group's samples by round.
+GROUPS_EXP = list(dict.fromkeys(SAMPLE[s]["group"] for s in NONINITIAL))
+
+
+def group_samples(g):
+    """Ordered samples for group g's matrix: the R0 initial library first, then g's rounds ascending."""
+    members = sorted((s for s in NONINITIAL if SAMPLE[s]["group"] == g),
+                     key=lambda s: (SAMPLE[s]["round"], s))
+    return [INITIAL] + members
 
 
 # ---- depletion-chain inputs --------------------------------------------------------

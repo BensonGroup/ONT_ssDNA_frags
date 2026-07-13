@@ -2,10 +2,12 @@
 #
 #   raw fastqs -> nanocomp                 (cross-sample read QC; parallel branch, gates nothing)
 #   clean -> train_hmm -> pychopper -> decode -> dedup -> featurecount -> {report_sample, report_cross}
+#                                                    └─► umi_correct -> umi_matrix -> report_umi_cross
 #
-# `dedup` (UMI deduplication) is skipped when config `umi_dedup.enabled` is false, in which case
-# featurecount and the reports are built from the raw decode tree instead. The decode tree is
-# always built either way — it is what dedup consumes.
+# `umi.mode` (default `correct`) drives the UMI stage. The `dedup/` tree always QC-filters and feeds
+# featurecount/reports (it COLLAPSES to molecules only in mode `dedup`). Mode `correct` additionally
+# runs the independent `umi/` branch: ed<=1 UMI correction, a per-group corrected-UMI x sample
+# matrix, and a cross-sample UMI report — none of which change the fragment counts.
 #
 # Run from the repo root (where pixi.toml lives):
 #   snakemake -n                 # dry-run: inspect the DAG
@@ -23,14 +25,18 @@ rule all:
         # cross-sample read QC on the raw fastqs (NanoComp — one combined report)
         f"{OUTDIR}/qc/nanocomp/bysample_NanoComp-report.html",
         # one interactive report per sample (experimental + the initial library), built from the
-        # dedup tree when umi_dedup.enabled, else from the raw decode tree
+        # processed dedup/ tree when the UMI stage runs (filter and/or collapse), else raw decode
         [f"{report_stem(s)}.featurecount_report.html" for s in SAMPLES],
         # the cross-sample comparison report, over that same tree
         f"{OUTDIR}/{CROSSBASE}/cross_sample_featurecount_report.html",
         # summaries (parity with the legacy scripts)
         f"{OUTDIR}/clean/clean_summary.tsv",
         f"{OUTDIR}/preprocess/batch_summary.tsv",
-        *([f"{OUTDIR}/dedup/umi_dedup_summary.tsv"] if DEDUP_ON else []),
+        *([f"{OUTDIR}/dedup/umi_dedup_summary.tsv"] if UMI_STAGE_ON else []),
+        # UMI characterisation branch (mode `correct`): per-group corrected-UMI x sample matrices +
+        # the cross-sample UMI report. Independent of the fragment reports above.
+        *([f"{OUTDIR}/umi/{g}.umi_x_sample.mtx" for g in GROUPS_EXP] if UMI_CORRECT_ON else []),
+        *([f"{OUTDIR}/umi/umi_report_cross.html"] if UMI_CORRECT_ON else []),
 
 
 include: "rules/qc.smk"
@@ -41,5 +47,6 @@ include: "rules/hmm.smk"
 include: "rules/preprocess.smk"
 include: "rules/decode.smk"
 include: "rules/dedup.smk"
+include: "rules/umi.smk"
 include: "rules/featurecounts.smk"
 include: "rules/reports.smk"

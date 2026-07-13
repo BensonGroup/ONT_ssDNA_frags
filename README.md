@@ -1,8 +1,8 @@
 # ONT ligated-DNA selection-screen workflow
 
 A Snakemake workflow for the Nanopore ligated-DNA selection screen: genomic depletion → primer-HMM
-training → pychopper preprocessing → cONcat (new) decode → UMI dedup → per-read feature counts →
-interactive HTML reports.
+training → pychopper preprocessing → cONcat (new) decode → UMI processing (filter / correct / dedup)
+→ per-read feature counts → interactive HTML reports.
 
 ```
 minikow/dorado passed fastq ─┬─► genomic contamination─┐
@@ -12,9 +12,11 @@ minikow/dorado passed fastq ─┬─► genomic contamination─┐
                                                                                        (new)     (new)                   └─► report_cross
 ```
 
-`dedup` collapses PCR/sequencing duplicates into molecules (see **UMI deduplication** below). It is
-on by default; set `umi_dedup.enabled: false` to build the reports from the raw read-level decode
-tree instead.
+The UMI stage is set by `umi.mode` (default **`correct`**): `filter` QC-filters garbage UMIs only;
+`correct` additionally corrects near-identical UMIs (ed≤1) and runs a separate **UMI characterisation
+branch** (per-molecule read counts, a per-group UMI×sample matrix, and a cross-sample UMI report)
+without touching the fragment reports; `dedup` collapses PCR/sequencing duplicates into molecules.
+This data must not be UMI-collapsed, so collapse is **off** by default. See **UMI processing** below.
 
 Environments are managed by **pixi** (conda-forge + bioconda); orchestration is Snakemake.
 Snakemake is pure Python and architecture-independent — the same workflow runs on `linux-aarch64`
@@ -90,37 +92,59 @@ Edit `config/config.yaml`. Point the paths at your data:
   ```
 - **adapters_fasta / pychopper_config / expected_sequences** — per-project; defaults ship in
   `resources/`. The primer HMM is *built each run* from the adapters + the initial-library sample.
-- **umi_dedup** — the deduplication stage (see below). Omit the block entirely and it stays on with
-  the defaults shown here.
+- **umi** — the UMI stage (see below). Omit the block entirely and it keeps the defaults shown here.
   ```yaml
-  umi_dedup:
-    enabled: true          # false -> reports built from the raw decode tree
+  umi:
+    mode: correct          # filter | correct | dedup   (default correct)
     max_homopolymer: 8     # drop a UMI whose longest homopolymer run is >= this
     max_base_frac:   0.7   # drop a UMI where any single base's fraction is >= this
   ```
 - **samples** — the sample table. Exactly one sample has `role: initial` (the R0 baseline). See example in this repo config/config.yaml
 
-## UMI deduplication
+## UMI processing (`umi.mode`)
 
-After decoding, each read carries two UMIs. `dedup` drops garbage UMIs (non-ACGT, low complexity,
-or outside the 10–12 nt length window), then collapses the survivors into **molecules** by
-clustering the fused UMI sequence with `starcode -d 1 -s` — sphere clustering at Levenshtein
-distance 1. One representative read per cluster survives, chosen by highest whole-read base-quality
-sum (the Picard MarkDuplicates convention), tie-broken by smallest `read_acc`.
+After decoding, each read carries two UMIs concatenated into `fused_seq` (~20–24 nt). `umi.mode`
+selects what happens next:
+
+- **`filter`** — drop garbage UMIs only (non-ACGT, low complexity, or outside the 10–12 nt length
+  window). Every surviving read is kept.
+- **`correct`** (default) — filter, then **correct** each surviving read's UMI to the most-abundant
+  ed≤1 variant by clustering with `starcode -d 1 -s` (spheres, Levenshtein distance 1) and relabelling
+  members to their sphere's centroid. **Nothing is collapsed** — duplicate molecules keep every one of
+  their reads. This additionally runs a separate `umi/` characterisation branch (below); the fragment
+  featurecount/reports are unaffected.
+- **`dedup`** — filter + correct + **collapse** to one representative read per molecule (highest
+  whole-read base-quality sum, the Picard MarkDuplicates convention). The collapsed tree feeds
+  featurecount/reports (classic UMI dedup).
 
 Levenshtein rather than Hamming distance is deliberate: the UMIs are variable length and ONT's
-dominant error mode is indels. `starcode` is pinned to a single thread (`-t 1`), which costs ~0.5 s
-per sample and makes the raw cluster table byte-reproducible across re-runs.
+dominant error mode is indels. `starcode` is pinned to a single thread (`-t 1`) for byte-reproducible
+cluster output (~0.5 s/sample).
 
-The stage writes a filtered copy of the sample under **the same basenames** into a sibling tree
-(`dedup/` ← `decode/`, `dedup_initial/` ← `decode_initial/`), so `featurecount` and the reports run
-against either tree unchanged. The raw `decode/` tree is always built — it is what `dedup` consumes
-— so flipping `enabled` reproduces the pre-dedup results without recomputing the decode.
+**Fragment pipeline.** In every mode the `dedup/` tree (QC-filtered, or collapsed in `dedup` mode)
+feeds `featurecount` and the fragment reports — correction never changes fragment counts. Each
+sample's dedup QC (`.umi_counts.tsv`, `.umi_clusters.tsv`, `.umi_audit.parquet`, and its
+`.umi_dedup_summary.tsv` row) sits in its own directory; the concatenation is `dedup/umi_dedup_summary.tsv`.
 
-Each sample's dedup QC (`.umi_counts.tsv`, `.umi_clusters.tsv`, `.umi_audit.parquet`, and its
-`.umi_dedup_summary.tsv` row) is written **into that sample's own directory**, next to the data it
-describes — the same convention as `<sample>.featurecount_report.html`. The concatenated table for
-all samples lands at `dedup/umi_dedup_summary.tsv`.
+**UMI characterisation branch (`correct`).** A separate `umi/` tree (sibling of `decode/`/`dedup/`,
+with `umi_initial/` for the R0 library), independent of the fragment reports. A read is kept only if
+it passes the UMI QC filter **and** decodes at least one **payload** fragment — *anchor-only* reads
+(valid UMI, backbone features only) are **dropped**, so a molecule's read count reflects only reads
+that actually decoded a ligand. Anchors come from the umis parquet via `ligand_vocab.anchor_set`
+(both orientations), the same authoritative source `build_featurecounts.py` uses; the fragment
+pipeline is unaffected and still counts every read. Per sample `umi/<s>/`:
+
+- `<s>.fused.parquet` — one row per kept (payload-bearing) read: `read_acc, strand, fused_seq,
+  fused_len, fused_seq_corrected, umi_read_count` (reads sharing this read's corrected UMI here).
+- `<s>.umi_species.tsv` — corrected `fused_seq  n_reads` (the matrix substrate).
+- `<s>.umi_summary.tsv` — per-sample filter/correction counts (incl. `dropped_no_payload`).
+
+Per experimental **group** (config `group`), one corrected-UMI × sample matrix with the R0 library as
+the **first column** (no all-sample matrix): `umi/<group>.umi_x_sample.long.parquet` (`fused_umi,
+sample, n_reads`; canonical), `.mtx` (Matrix Market triplets), and `.{umis,samples}.tsv` (row/column
+labels). Finally `umi/umi_report_cross.html` — a descriptive QC report (rank-abundance, D50/D90
+complexity, per-group species-overlap UpSet, and validity QC: UMI-group ligand-signature purity vs
+size and a collision null model). It draws no biological conclusions.
 
 ## Run (from the repo root)
 
@@ -131,7 +155,8 @@ concatsmk -n --printshellcmds --configfile /abs/path/to/your_config.yaml        
 concatsmk --cores 18 --configfile /abs/path/to/your_config.yaml                # full run (reads config/config.yaml by default)
 concatsmk --cores 8 /abs/path/to/results/dedup/your.featurecount_report.html    # build one target
 concatsmk check_all --cores 4        # optional: validate every featurecount against its raw parquet
-concatsmk -n --config umi_dedup='{"enabled": false}'   # dry-run the pre-dedup DAG
+concatsmk -n --config umi='{"mode": "dedup"}'    # dry-run WITH UMI collapse (classic dedup)
+concatsmk -n --config umi='{"mode": "filter"}'   # dry-run filter-only (no correction branch)
 python3 workflow/scripts/umi_filter_lib.py             # optional: UMI-classification self-test
 ```
 
@@ -141,8 +166,8 @@ Note the `--` separator when a target follows `--configfile` (which takes severa
 ## Outputs (under `config.outdir`, default `results/`)
 
 
-Below, `<tree>` is `dedup` when `umi_dedup.enabled` (the default) and `decode` otherwise; the
-initial library lives in the matching `<tree>_initial/`.
+Below, `<tree>` is `dedup` (the UMI stage always QC-filters, so featurecount/reports run on the
+`dedup/` tree; in mode `dedup` it is the collapsed tree); the initial library lives in `dedup_initial/`.
 
 | Path                                                                                                          | What                                                                         |
 | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -150,9 +175,12 @@ initial library lives in the matching `<tree>_initial/`.
 | `hmm/<adapters>.hmm` (+ hmmpress DB)                                                                          | trained primer HMM                                                           |
 | `preprocess/<sample>/<sample>.full_length.fq` (+ rescued/…/stats/report/bed), `preprocess/batch_summary.tsv` | pychopper outputs                                                            |
 | `decode/<sample>/…` (experimental), `decode_initial/<initial>/…`                                            | LigandFrags2 decode (fragments/umis/fused/trimmed parquet, fused_reads.fq, ligateddna.log) |
-| `dedup/<sample>/…` (experimental), `dedup_initial/<initial>/…`                                              | the same artifacts, filtered to one representative read per UMI molecule; `ligateddna.log` gains a provenance block |
-| `dedup/<sample>/<sample>.{umi_counts,umi_clusters}.tsv`, `.umi_audit.parquet`, `.umi_dedup_summary.tsv`        | that sample's dedup QC, beside the data it describes: starcode input/output, a one-row-per-input-read audit, and its summary row |
-| `dedup/umi_dedup_summary.tsv`                                                                                 | all samples: reads in → molecules out, drop classes, duplicate rate          |
+| `dedup/<sample>/…` (experimental), `dedup_initial/<initial>/…`                                              | the same artifacts, QC-filtered (and, with dedup on, reduced to one representative read per UMI molecule); `ligateddna.log` gains a provenance block |
+| `dedup/<sample>/<sample>.{umi_counts,umi_clusters}.tsv`, `.umi_audit.parquet`, `.umi_dedup_summary.tsv`        | that sample's UMI QC, beside the data it describes: UMI counts, starcode clusters (empty unless dedup on), a one-row-per-input-read audit, and its summary row |
+| `dedup/umi_dedup_summary.tsv`                                                                                 | all samples: reads in → reads kept (molecules out with dedup on), drop classes, duplicate rate |
+| `umi/<sample>/<sample>.fused.parquet`, `.umi_species.tsv`, `.umi_summary.tsv` (+ `umi_initial/`)             | (mode `correct`) corrected UMIs over **payload-bearing reads only**: per-read `fused_seq_corrected` + `umi_read_count`, the species→count table, and filter/correction counts |
+| `umi/<group>.umi_x_sample.{long.parquet,mtx,umis.tsv,samples.tsv}`                                            | (mode `correct`) per-group corrected-UMI × sample read-count matrix, R0 library as the first column |
+| `umi/umi_report_cross.html`                                                                                   | (mode `correct`) cross-sample UMI QC report (abundance, species overlap, validity) |
 | `<tree>/<sample>/<sample>.featurecount.parquet` + `.summary.tsv`                                              | per-read feature counts                                                      |
 | `<tree>/<sample>/<sample>.featurecount_report.html`                                                           | per-sample interactive report                                                |
 | `<tree>/cross_sample_featurecount_report.html`                                                                | cross-sample comparison report                                               |
