@@ -53,8 +53,9 @@ if R0_STEM is not None and not R0_STEM.is_absolute():
 OUT = BASE / "cross_sample_featurecount_report.html"
 
 # Optional per-sample metadata written by Snakemake from the config `samples` table
-# (TSV: name<TAB>group<TAB>round<TAB>idx<TAB>role). When present it is authoritative: `group` becomes
-# the grouping/ordering axis and `round`/`idx` order samples within and across groups. Absent
+# (TSV: name<TAB>group<TAB>round<TAB>idx -- there is no `role` column; the group decides everything,
+# see report_lib's reserved names). When present it is authoritative: `group` becomes the
+# grouping/ordering axis and `round`/`idx` order samples within and across groups. Absent
 # (e.g. a standalone run), the script falls back to parsing group+round from the sample name.
 #
 # The metadata now carries the initial library's row too, so the baseline's group comes from the

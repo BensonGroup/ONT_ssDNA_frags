@@ -77,23 +77,68 @@ threads:
 report:
   r0_baseline: true  # wire the initial library as the shared R0 baseline in the cross report
 
-# ---- samples ------------------------------------------------------------------------
-# role: experimental | initial | control   (exactly one `initial`, used as the R0 baseline).
-#   control = an EMPTY / PCR-only round: the same transfers and PCR cycles as a selection round, but no
-#   biological material. It is the null for everything that depends on the pool being bottlenecked, and
-#   is the ONLY way to separate the complexity collapse caused by SELECTION from the collapse caused by
-#   the protocol itself (each aliquot transfer is a bottleneck). Controls run through every stage and
-#   appear in every report, but never form a group matrix.
-# group = cell line, round = selection round. Names must be globally unique.
+# ---- groups and samples -------------------------------------------------------------
+# READ THIS BEFORE EDITING THE TABLE BELOW. There is no `role:` field: a sample's GROUP decides
+# everything -- which tree it is decoded into, whether it forms a group matrix, how its complexity
+# collapse is labelled. A bad table is REJECTED at parse time, with a message naming the offending
+# sample; the workflow never guesses what you meant and never quietly works around it.
+#
+# `groups:` DECLARES every group name used in `samples:`. That is what makes a typo an error instead of
+# a brand-new, silently half-empty arm: write `group: A594` for one MDA round and, without this list,
+# you get a third "cell line" with one sample in it and no warning. Every declared group must have at
+# least one sample (an empty declaration raises too), and every group EXCEPT `initial` gets its own
+# group x sample matrix, its own colour, and its own line in every report.
+#
+# WRITING YOUR OWN CONFIG: declare `groups:` IN THE SAME FILE that carries your `samples:`. Snakemake
+# layers a `--configfile` ON TOP of this default config rather than replacing it, so a top-level key
+# your file omits is silently inherited from here -- your samples would then be validated against a
+# group list you never wrote. The workflow raises instead of letting that happen.
+#
+# TWO RESERVED GROUP NAMES:
+#
+#   initial -- the R0 baseline library. EXACTLY ONE sample (one config = one project = one R0). It is
+#              decoded into its own `*_initial/` tree and wired in as the shared first column of every
+#              group matrix, so the cross-reports never see it as both a column and the baseline.
+#
+#   empty   -- the EMPTY / PCR-only rounds: the same aliquot transfers and PCR cycles as a selection
+#              round, but NO biological material. Each transfer is itself a bottleneck, so complexity
+#              collapses even with no selection -- an empty round is the ONLY way to separate the
+#              collapse caused by SELECTION from the collapse caused by the PROTOCOL. It is a full PEER
+#              of a cell-line arm: its own matrix, its own colour, its own C_eff trajectory line, its
+#              own UpSet panel. It is special in exactly ONE place -- the collapse table, where its
+#              collapse vs R0 is labelled `protocol` instead of `total`, because with no cells that
+#              ratio IS what the plumbing cost. At most ONE empty sample per `round` (it is the null
+#              that every real sample of that round is compared against). To add one: put `empty` in
+#              `groups:` and its rounds in `samples:`. Nothing else changes.
+#
+# Every other group is a selection arm (here, a cell line: A549 / MDA).
+#
+# ORDER MATTERS IN `samples:`, NOT IN `groups:`. Report colours are assigned in the order a group FIRST
+# APPEARS in `samples:` -- the `groups:` list itself never reaches a report. So APPEND a new group's rows
+# at the END of `samples:`. Insert them in the middle and every group below them is silently re-coloured
+# in all three reports.
+#
+# Per-sample keys (all four required):
+#   name  -- globally unique. It becomes a DIRECTORY and the filename stem inside it
+#            (results/umi/<name>/<name>.fused.parquet), so: no '/', no spaces, and it may not equal a
+#            group name (group matrices are written as results/umi/<group>.umi_x_sample.mtx, i.e. into
+#            that same parent directory -- names and groups share one namespace on disk).
+#   group -- must be listed in `groups:` above.
+#   round -- an integer. R0 = the initial library. It orders a group's samples, and pairs an `empty`
+#            round to the real rounds with the same transfer/PCR count.
+#   fastq -- absolute path, and the FILE MUST EXIST: snakemake stats every input even on a dry run.
+groups: [initial, A549, MDA]   # add `empty` here when you add empty/PCR-only rounds below
 samples:
-  - {name: A549_R1, group: A549, round: 1, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R1.fastq}
-  - {name: A549_R2, group: A549, round: 2, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R2.fastq}
-  - {name: A549_R3, group: A549, round: 3, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R3.fastq}
-  - {name: A549_R4, group: A549, round: 4, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R4.fastq}
-  - {name: A549_R5, group: A549, round: 5, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R5.fastq}
-  - {name: MDA_R1,  group: MDA,  round: 1, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R1.fastq}
-  - {name: MDA_R2,  group: MDA,  round: 2, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R2.fastq}
-  - {name: MDA_R3,  group: MDA,  round: 3, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R3.fastq}
-  - {name: MDA_R4,  group: MDA,  round: 4, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R4.fastq}
-  - {name: MDA_R5,  group: MDA,  round: 5, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R5.fastq}
-  - {name: 2026initial_library, group: initial, round: 0, role: initial, fastq: /home/hongj/projects/cell/rawdata/ONT/initial4A549_MDA/2026initial_library.fastq}
+  - {name: A549_R1, group: A549, round: 1, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R1.fastq}
+  - {name: A549_R2, group: A549, round: 2, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R2.fastq}
+  - {name: A549_R3, group: A549, round: 3, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R3.fastq}
+  - {name: A549_R4, group: A549, round: 4, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R4.fastq}
+  - {name: A549_R5, group: A549, round: 5, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R5.fastq}
+  - {name: MDA_R1,  group: MDA,  round: 1, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R1.fastq}
+  - {name: MDA_R2,  group: MDA,  round: 2, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R2.fastq}
+  - {name: MDA_R3,  group: MDA,  round: 3, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R3.fastq}
+  - {name: MDA_R4,  group: MDA,  round: 4, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R4.fastq}
+  - {name: MDA_R5,  group: MDA,  round: 5, fastq: /home/hongj/projects/cell/rawdata/ONT/MDA/MDA_R5.fastq}
+  - {name: 2026initial_library, group: initial, round: 0, fastq: /home/hongj/projects/cell/rawdata/ONT/initial4A549_MDA/2026initial_library.fastq}
+  # An empty / PCR-only round, if the project has one -- declare `empty` in `groups:` above, then:
+  # - {name: empty_R5, group: empty, round: 5, fastq: /abs/path/to/empty_R5.fastq}

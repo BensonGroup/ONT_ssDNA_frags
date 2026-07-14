@@ -36,12 +36,12 @@ def _dedup_src_stem(wc):
     """The raw decode stem feeding a dedup stem, and the guard that keeps a sample out of the wrong
     tree. `wildcard_constraints` can pin `dedbase` and `sample` independently but cannot express
     "sample must match dedbase"; without this check `results/dedup/<initial>/…` would happily build
-    the R0 baseline into the experimental tree, where report_cross's `dedup/*/` glob would then
+    the R0 baseline into the shared non-initial tree, where report_cross's `dedup/*/` glob would then
     count it twice (once as a column, once as the baseline)."""
-    want = dedbase(wc.sample)                     # role -> dedup | dedup_initial
+    want = dedbase(wc.sample)                     # group -> dedup | dedup_initial
     if wc.dedbase != want:
         raise ValueError(
-            f"sample {wc.sample!r} (role {SAMPLE[wc.sample]['role']!r}) belongs in "
+            f"sample {wc.sample!r} (group {SAMPLE[wc.sample]['group']!r}) belongs in "
             f"{want}/, not {wc.dedbase}/")
     src = "decode_initial" if wc.dedbase == "dedup_initial" else "decode"
     return f"{OUTDIR}/{src}/{wc.sample}/{wc.sample}"
@@ -90,7 +90,7 @@ rule dedup:
 
 
 # Concatenate the per-sample dedup summary rows (parity with clean_summary / pychopper_summary).
-# Each row is now a concrete path — dedup_stem() resolves the tree from the sample's role — so the
+# Each row is now a concrete path — dedup_stem() resolves the tree from the sample's group — so the
 # rows can be depended on directly. The combined table is a cross-sample artifact, so it sits at the
 # tree root next to the cross report, pulling the initial library's row from the sibling
 # dedup_initial/ tree exactly as report_cross pulls its R0 baseline. Rows follow config order.

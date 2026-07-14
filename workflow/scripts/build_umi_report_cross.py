@@ -9,13 +9,20 @@ EVERY FIGURE IS ORGANISED BY `group` -- the config's cell line. One colour per g
 CVD-validated palette, the same colour in all three cross reports), the R0 initial library always
 grey and dashed because it is a shared baseline, not a selection arm.
 
+`group` is the ONLY sample axis -- there is no `role` field (see report_lib's reserved names). The
+`empty` arm (the PCR-only / no-cell rounds) is a PEER of every selection arm HERE: its own colour,
+its own C_eff trajectory line, its own UpSet panel, its own purity trace, and NO special-casing in
+any figure function. The one place this report knows the word `empty` is the "Protocol collapse"
+subsection, which renders the `kind: protocol` collapse rows -- and even that reads the `kind`, not
+the group name. If you find yourself writing `if group == EMPTY_GROUP` inside a figure, stop.
+
 Panels (no biological interpretation -- this is a workflow):
   * Summary        per-sample reads in / filtered (by class) / corrected (species merged, relabelled).
   * Complexity     C_eff vs selection round per group, the collapse relative to R0, and the
                    depth-corrected richness. THE depth-robust view; read it before anything below.
   * Abundance      rank-abundance curves (log-log) and D50/D90 = the proportion of distinct UMI
                    species whose cumulative reads reach 50% / 90% (+ a Lorenz-style curve).
-  * Overlap        per experimental group, an UpSet-like view of distinct corrected-UMI species
+  * Overlap        per non-baseline group, an UpSet-like view of distinct corrected-UMI species
                    shared across the group's samples (top-N intersections).
   * Validity QC    UMI-group ligand-signature purity vs group size (join corrected UMI -> decode
                    fragments), per group, and a collision null model (expected chance ed<=1 merges
@@ -31,7 +38,7 @@ silently disagreed with the table whenever report.r0_baseline was off.
 Parameterised entirely by environment variables (set by rule report_umi_cross):
     L2F_BASE          umi/ dir to glob `*/` for experimental sample subdirs
     L2F_R0_STEM       umi_initial/.../<INITIAL> stem for the R0 baseline ("" disables it)
-    L2F_SAMPLES       config-derived metadata TSV (name<TAB>group<TAB>round<TAB>idx<TAB>role)
+    L2F_SAMPLES       config-derived metadata TSV (name<TAB>group<TAB>round<TAB>idx)
     L2F_COMPLEXITY    per-sample complexity table (umi_complexity.tsv)
     L2F_COLLAPSE      per-sample collapse ratios (umi_collapse.tsv)
     L2F_DECODE_BASE   decode/ dir (experimental fragments for the purity QC)
@@ -52,8 +59,8 @@ from plotly.offline import get_plotlyjs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from report_lib import (
-    BASELINE_GREY, GREY, color_key_html, esc, fig_html, first_of_group, group_band, group_color,
-    group_dividers, load_meta,
+    BASELINE_GREY, BASELINE_GROUP, GREY, color_key_html, esc, fig_html, first_of_group, group_band,
+    group_color, group_dividers, load_meta,
 )
 
 BASE = Path(os.environ.get("L2F_BASE", "")).resolve()
@@ -99,7 +106,6 @@ def discover(meta):
             "group": m.get("group", _parse_group(name)),
             "round": m.get("round", _parse_round(name)),
             "idx": m.get("idx", 10_000),
-            "role": m.get("role", "experimental"),
             "is_baseline": False,
         })
     samples.sort(key=lambda s: (s["idx"], s["round"], s["name"]))
@@ -113,9 +119,10 @@ def discover(meta):
                 "fused": r0.parent / f"{r0.name}.fused.parquet",
                 "frags": Path(R0_FRAGS) if R0_FRAGS else None,
                 # the baseline's group/round now come from the config like everyone else's; the
-                # literals are only the fallback for a standalone run with no metadata TSV
-                "group": m.get("group", "initial"), "round": m.get("round", 0),
-                "idx": -1, "role": "initial", "is_baseline": True,
+                # literals are only the fallback for a standalone run with no metadata TSV.
+                # `is_baseline` is what every consumer keys on -- there is no `role` field.
+                "group": m.get("group", BASELINE_GROUP), "round": m.get("round", 0),
+                "idx": -1, "is_baseline": True,
             })
     return samples
 
@@ -182,6 +189,47 @@ def fmt(v, nd=0):
     return f"{v:,}"
 
 
+def collapse_vs_r0(collapse):
+    """{sample: its ONE collapse-vs-R0 row} -- keyed on the row, NOT on the label it carries.
+
+    THE INVARIANT (effective_complexity.py): every non-initial sample has exactly ONE collapse row
+    measured against R0. Its `kind` is `protocol` when the sample is in the `empty` group -- with no
+    cells, C_eff(R0)/C_eff(empty) IS what the transfers and PCR cost -- and `total` otherwise. The
+    two are MUTUALLY EXCLUSIVE per sample (see the if/else that emits them), so this lookup is
+    unambiguous, and `kind` still says which one it is, so a caller can keep the label honest.
+
+    Filtering on `kind == "total"` instead -- as this file used to -- silently drops the empty arm:
+    no fold-drop annotation on its trajectory, a blank "collapse vs R0" cell in the table. That is
+    the exact gap the empty arm exists to close, so it must not be reintroduced. `selection` rows
+    are extra, never a substitute; they are rendered by protocol_collapse_section() alone.
+    """
+    return {r["sample"]: r for r in collapse if r["kind"] in ("total", "protocol")}
+
+
+def ratio_num(v, nd=1):
+    """A collapse ratio, formatted for reading WITHOUT rounding it into a different story.
+
+    Below 1x it is not a collapse at all -- complexity held or ROSE -- and a fixed `,.1f` would print
+    0.0239 as `0.0` and 0.294 as `0.3`: a fabricated zero on the one arm most likely to produce a
+    sub-1 ratio (an un-bottlenecked `empty` round has a HUGE C_eff, so C_eff(R0)/C_eff(empty) < 1).
+    Small ratios therefore keep their significant figures -- the same rule as effective_complexity's
+    fold(), which the workflow log already prints, so the report and the log cannot disagree.
+    """
+    return f"{v:,.{nd}f}" if v >= 1 else f"{v:.3g}"
+
+
+def ratio_cell(row, nd=1):
+    """A collapse ratio cell, carrying its bound marker (`<` / `>`) when it is not a point estimate.
+
+    `is None`, not falsiness: a ratio that is genuinely 0-ish is a MEASUREMENT (complexity rose by
+    more than the 4 significant figures the TSV carries), not a missing value, and blanking it would
+    hide the very number the empty arm exists to state.
+    """
+    if not row or row.get("ratio") is None:
+        return ""
+    return f"{esc(row.get('ratio_bound') or '')}{ratio_num(row['ratio'], nd)}×"
+
+
 def c_eff_cell(row):
     """C_eff, prefixed `>` when it is only a 95% lower bound (no collisions observed).
 
@@ -244,7 +292,7 @@ def fig_ceff_trajectory(samples, cplx, collapse, gcol):
     by_name = {r["name"]: r for r in cplx}
     base = next((s for s in samples if s["is_baseline"]), None)
     brow = by_name.get(base["name"]) if base else None
-    total = {r["sample"]: r for r in collapse if r.get("kind") == "total"}
+    vs_r0 = collapse_vs_r0(collapse)
 
     groups = [g for g in dict.fromkeys(s["group"] for s in samples if not s["is_baseline"])]
     fig = go.Figure()
@@ -275,12 +323,31 @@ def fig_ceff_trajectory(samples, cplx, collapse, gcol):
             hovertemplate=("%{customdata[0]}<br>C_eff %{y:,.0f}<br>"
                            "%{customdata[1]:,} duplicate pairs<extra>" + esc(g) + "</extra>"),
         ))
-        # the fold-drop, stated at the end of each arm (and only where it is a point estimate)
+        # The fold-drop, stated at the end of each arm. `vs_r0` is keyed on the collapse-vs-R0 row
+        # WHATEVER IT IS CALLED, so the empty arm -- whose only row is `kind: protocol` -- gets its
+        # annotation like every other group. This is not a special case: it is the absence of one.
+        #
+        # A BOUNDED ratio IS annotated, carrying its `<` / `>` marker. It has to be. An un-bottlenecked
+        # empty round has NO duplicate reads at all (no cells => nothing is selected away => every
+        # molecule is seen once), so its c_eff is only a 95% LOWER bound, so its collapse ratio is a
+        # BOUND. Skipping bounded ratios here -- which this line used to do -- blanked the empty arm's
+        # annotation in EXACTLY the case the annotation exists for, and the fixture never caught it
+        # because it built the empty round as a copy of a real round (which has duplicates, hence no
+        # bound). `ratio_cell()` already carries the marker in every table on this page; this line must
+        # not disagree with it.
         last = members[-1]["name"] if members else None
-        row = total.get(last)
-        if row and row.get("ratio") and not row.get("ratio_bound"):
+        row = vs_r0.get(last)
+        if row and row.get("ratio") is not None:
+            v = row["ratio"]
+            b = esc(row.get("ratio_bound") or "")
+            # Below 1x there was no drop: complexity held or ROSE (the shape of an un-bottlenecked
+            # empty round, whose line visibly climbs above R0 right here). Print the number with its
+            # significant figures and say what it is -- `,.0f` would label that line "0× drop", a
+            # fabricated zero with the wrong word attached to it.
+            txt = (f"{b}{ratio_num(v, 0)}× drop" if v >= 1
+                   else f"{b}{ratio_num(v)}× — complexity ROSE")
             fig.add_annotation(x=xs[-1], y=math.log10(ys[-1]), xref="x", yref="y",
-                               text=f"<b>{esc(g)}</b>  {row['ratio']:,.0f}× drop",
+                               text=f"<b>{esc(g)}</b>  {txt}",
                                xanchor="left", xshift=12, showarrow=False,
                                font=dict(size=11, color=gcol.get(g, GREY)))
     if brow and brow.get("c_eff"):
@@ -302,14 +369,15 @@ def fig_ceff_trajectory(samples, cplx, collapse, gcol):
 def ceff_table(samples, cplx, collapse, gcol):
     """C_eff with the three companions clarification.md §8.5 requires it never be read without."""
     by_name = {r["name"]: r for r in cplx}
-    total = {r["sample"]: r for r in collapse if r.get("kind") == "total"}
+    vs_r0 = collapse_vs_r0(collapse)      # one row per sample, `total` OR `protocol` -- see helper
     order = [s for s in samples if s["name"] in by_name]
     rows = []
     for s in order:
         r = by_name[s["name"]]
-        col = total.get(s["name"], {})
-        ratio = ("" if not col.get("ratio")
-                 else f"{esc(col.get('ratio_bound') or '')}{col['ratio']:,.1f}×")
+        # ONE formatter for every collapse ratio in this report (the table, the protocol section, the
+        # trajectory annotation), so a sub-1 ratio cannot render as `0.0×` in one place and 0.294 in
+        # another. Do not re-implement it inline.
+        ratio = ratio_cell(vs_r0.get(s["name"]))
         top = ("" if r.get("top10_share_of_S") is None
                else f"{100 * r['top10_share_of_S']:.1f}%")
         swatch = (f"<span style='display:inline-block;width:.7rem;height:.7rem;border-radius:2px;"
@@ -339,7 +407,9 @@ def ceff_table(samples, cplx, collapse, gcol):
         "<th title='&lt;&lt;1 = you sampled a small fraction of the pool'>N/C_eff</th>"
         "<th title='reads on the single most abundant lineage'>max nᵢ</th>"
         "<th title='share of all collisions carried by the top 10 lineages'>top10 %S</th>"
-        "<th title='C_eff(R0) / C_eff(sample)'>collapse vs R0</th>"
+        "<th title='C_eff(R0) / C_eff(sample) — the sample&#39;s ONE collapse-vs-R0 row: kind "
+        "`total` for a selection arm, kind `protocol` for the empty arm (same ratio, and with no "
+        "cells it measures the transfers + PCR alone)'>collapse vs R0</th>"
         "</tr>")
     return (f"<div style='overflow-x:auto'><table><thead>{head}</thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>")
@@ -387,6 +457,83 @@ def fig_depth_complexity(samples, cplx, gcol):
         f"magnitude. Where the two disagree, <code>C_eff</code> is the one still saying something "
         f"about the library.</p>")
     return note + fig_html(style(fig, 480, "Richness at a common depth (depth-corrected)", top=88))
+
+
+def protocol_collapse_section(cplx, collapse, gcol):
+    """The `kind: protocol` rows -- what the plumbing cost, with no cells in the tube.
+
+    THE ONLY PLACE THIS REPORT KNOWS THE WORD `empty`, and even here it reads the collapse `kind`,
+    not the group name: no figure is special-cased, because the empty arm is a peer group and needs
+    no help to be drawn. ABSENT ENTIRELY when the config declares no empty arm -- there are then no
+    `protocol` rows, no `selection` rows, and the report degrades to `total` alone, rendering
+    exactly as it did before this section existed. That is the acceptance criterion, not a fallback.
+    """
+    prot = [r for r in collapse if r["kind"] == "protocol"]
+    if not prot:
+        return ""
+    by_name = {r["name"]: r for r in cplx}
+    sel = [r for r in collapse if r["kind"] == "selection"]
+    total = {r["sample"]: r for r in collapse if r["kind"] == "total"}
+    by_empty = {r["sample"]: r for r in prot}
+
+    def swatch(g):
+        return (f"<span style='display:inline-block;width:.7rem;height:.7rem;border-radius:2px;"
+                f"margin-right:.4rem;background:{gcol.get(g, GREY)}'></span>")
+
+    prot_rows = "".join(
+        f"<tr><td>{swatch(r['group'])}{esc(r['sample'])}</td>"
+        f"<td class='num'>{fmt(r.get('round'))}</td>"
+        f"<td class='num'>{c_eff_cell(by_name.get(r['sample'], {}))}</td>"
+        f"<td class='num'><b>{ratio_cell(r)}</b></td></tr>"
+        for r in sorted(prot, key=lambda r: (r.get("round") or 0, r["sample"])))
+    out = [
+        "<h3>Protocol collapse — the empty round</h3>",
+        "<p class='small'>The <code>empty</code> arm went through the same transfers and the same PCR "
+        "as a selection arm, with <b>no cells in the tube</b>. Nothing could be selected for, so "
+        "whatever complexity it lost relative to R0 is what the <em>protocol alone</em> cost — the "
+        "handling and the re-amplification, with no biology in it. That is the number below. It is "
+        "not a correction that has been applied to anything: it is measured on its own arm, and the "
+        "arms below are the ones it lets you divide it out of.</p>",
+        f"<div style='overflow-x:auto'><table><thead><tr><th>empty round</th><th>round</th>"
+        f"<th title='the empty round&#39;s own effective complexity'>C_eff</th>"
+        f"<th title='C_eff(R0) / C_eff(empty) — the sample&#39;s ONE collapse-vs-R0 row, here "
+        f"labelled `protocol` because with no cells it measures the protocol alone'>"
+        f"protocol collapse (vs R0)</th></tr></thead><tbody>{prot_rows}</tbody></table></div>",
+        "<p class='small'>This is not a separate measurement bolted on beside the figures: <b>the "
+        "empty arm's line on the C<sub>eff</sub> trajectory above IS this number, drawn</b>, and its "
+        "cell in the <code>collapse vs R0</code> column above IS this number, tabulated. One "
+        "collapse row, one label, three renderings of it.</p>",
+    ]
+    if sel:
+        srows = "".join(
+            f"<tr><td>{swatch(r['group'])}{esc(r['sample'])}</td>"
+            f"<td class='num'>{fmt(r.get('round'))}</td>"
+            f"<td class='num'>{ratio_cell(total.get(r['sample']), nd=2)}</td>"
+            f"<td class='num'>{ratio_cell(by_empty.get(r['num']), nd=2)}</td>"
+            f"<td class='num'><b>{ratio_cell(r, nd=2)}</b></td>"
+            f"<td>{esc(r['num'])}</td></tr>"
+            for r in sorted(sel, key=lambda r: (r.get("round") or 0, r["sample"])))
+        out += [
+            f"<div style='overflow-x:auto'><table><thead><tr><th>sample</th><th>round</th>"
+            f"<th title='C_eff(R0) / C_eff(sample) — everything that happened'>total</th>"
+            f"<th title='C_eff(R0) / C_eff(empty) — the protocol&#39;s share, from the row above'>"
+            f"protocol</th>"
+            f"<th title='C_eff(empty) / C_eff(sample) — what is left once the protocol is divided "
+            f"out'>selection</th><th>empty round used</th></tr></thead>"
+            f"<tbody>{srows}</tbody></table></div>",
+            "<p class='small'><b>total = protocol × selection</b>, exactly: "
+            "<code>C_eff(R0)/C_eff(sample) = [C_eff(R0)/C_eff(empty)] × "
+            "[C_eff(empty)/C_eff(sample)]</code>, the empty round's C<sub>eff</sub> cancelling. The "
+            "identity is exact by that cancellation, not a fit — though the cells above are rounded "
+            "for reading, so multiplying them by hand closes only to the digits shown. The three "
+            "columns are three <em>distinct</em> collapse rows, not one number restated three "
+            "times. <code>selection</code> is the column with any biology in it: it pairs a sample "
+            "to the empty round at the <b>same</b> round — the one that went through the same "
+            "number of transfers and PCR cycles — so a sample at a round with no matching empty "
+            "round has a <code>total</code> and nothing else. The decomposition is then simply not "
+            "available for it, and is not guessed at.</p>",
+        ]
+    return "\n".join(out)
 
 
 def _plot_idx(n, cap=2000):
@@ -690,6 +837,9 @@ def main():
         fig_ceff_trajectory(samples, cplx, collapse, gcol),
         ceff_table(samples, cplx, collapse, gcol),
         fig_depth_complexity(samples, cplx, gcol),
+        # "" when the config declares no `empty` arm -- the join below drops it, and the report
+        # renders exactly as it did before this subsection existed.
+        protocol_collapse_section(cplx, collapse, gcol),
 
         "<h2>Abundance</h2>",
         "<p class='small'>⚠ Both panels below are species counts and are therefore <b>depth-sensitive</b>: "
@@ -703,9 +853,10 @@ def main():
         "built on unequal depths overstates the overlap of the deeper pair. Rarefaction is not meaningful "
         "here (it would change set membership), so treat these intersections as qualitative.</p>",
     ]
-    exp_groups = list(dict.fromkeys(s["group"] for s in samples if not s["is_baseline"]))
+    # every non-baseline group gets an UpSet panel -- `empty` included, with no branch for it
+    groups = list(dict.fromkeys(s["group"] for s in samples if not s["is_baseline"]))
     base_name = next((s["name"] for s in samples if s["is_baseline"]), None)
-    for g in exp_groups:
+    for g in groups:
         gs = ([base_name] if base_name else []) + [s["name"] for s in samples
                                                    if s["group"] == g and not s["is_baseline"]]
         H.append(fig_upset(g, gs, species, gcol.get(g, GREY)))

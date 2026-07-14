@@ -1,8 +1,9 @@
 # ONT ligated-DNA selection-screen workflow
 
 A Snakemake workflow for the Nanopore ligated-DNA selection screen: genomic depletion → primer-HMM
-training → pychopper preprocessing → cONcat (new) decode → UMI processing (filter / correct / dedup)
-→ per-read feature counts → interactive HTML reports.
+training → pychopper preprocessing → cONcat (new) decode → per-read feature counts → interactive HTML
+reports, plus two independent analysis branches off `decode`: **UMI processing** (filter / correct /
+dedup) and **fragment-vector quantification** (the two-axis abundance + incidence readout).
 
 ```
 minikow/dorado passed fastq ─┬─► genomic contamination─┐
@@ -21,6 +22,25 @@ This data must not be UMI-collapsed, so collapse is **off** by default. See **UM
 Environments are managed by **pixi** (conda-forge + bioconda); orchestration is Snakemake.
 Snakemake is pure Python and architecture-independent — the same workflow runs on `linux-aarch64`
 and `linux-64`; only the tools it calls are per-arch (pixi re-solves; the Rust decoder recompiles).
+
+## Scope
+
+**One config = one project.** A project has:
+
+- **one initial library** — `group: initial`, the R0 baseline, exactly one sample;
+- **at most one `empty` arm** — `group: empty`, the PCR-only / no-cell rounds, shared as the null for
+  *every* experimental arm (one empty round per selection round, not one per cell line);
+- **any number of experimental selection arms** — `group: A549`, `group: MDA`, …
+
+A sample's **`group` decides everything**: which tree it is decoded into, whether it forms a group
+matrix, how its complexity collapse is labelled. There is no `role` field. See
+[Writing the sample table](#writing-the-sample-table).
+
+**This workflow produces diagnostics, not conclusions.** It decodes, QCs, corrects UMIs, quantifies
+fragment vectors, and emits **count tables, per-group × sample matrices, and diagnostic reports**. It
+deliberately does **not** do project-specific downstream analysis — no hit calling, no enrichment
+testing, no structure work. Take the matrices and count tables and do whatever your project needs;
+every number in the reports is reproducible from them.
 
 ## Set up envs
 
@@ -99,7 +119,135 @@ Edit `config/config.yaml`. Point the paths at your data:
     max_homopolymer: 8     # drop a UMI whose longest homopolymer run is >= this
     max_base_frac:   0.7   # drop a UMI where any single base's fraction is >= this
   ```
-- **samples** — the sample table. Exactly one sample has `role: initial` (the R0 baseline). See example in this repo config/config.yaml
+- **fragvec** — the fragment-vector branch (see below). A sibling of the `umi` branch; run either or both.
+  ```yaml
+  fragvec:
+    enabled: true
+    umi_source: corrected  # corrected (needs umi.mode: correct) | raw (stand-alone)
+    min_reads: 10          # counts below this are FLAGGED as noise, not dropped
+  ```
+- **groups** — every group name used in `samples:`, declared once:
+  ```yaml
+  groups: [initial, A549, MDA]   # add `empty` when you add PCR-only rounds
+  ```
+  This is the typo guard: a sample whose `group` is not in this list **raises**, instead of silently
+  minting a new, half-empty selection arm. A declared group with no samples raises too. It must be
+  declared **in the same file that declares `samples:`** — snakemake layers a `--configfile` *on top
+  of* the workflow's default config, so an omitted `groups:` would otherwise be silently inherited and
+  your samples validated against a list you never wrote. The *order* of this list reaches no report —
+  report order and colours come from `samples:` (see below).
+- **samples** — the sample table; four keys, no `role`. See **[Writing the sample
+  table](#writing-the-sample-table)**.
+  - **`group: empty`** = an **empty / PCR-only round**: the same aliquot transfers and PCR cycles as a
+    selection round, but *no biological material*. Each transfer is itself a bottleneck, so complexity
+    drops even with no selection — and an empty round is the **only** way to separate the collapse
+    caused by selection from the collapse caused by the protocol. The three numbers the reports emit,
+    with the `kind` label each one carries in `umi_collapse.tsv`:
+    ```
+    protocol   collapse = c_eff(R0)       / c_eff(empty_Rk)   <- reported ON the empty round
+    selection  collapse = c_eff(empty_Rk) / c_eff(real_Rk)    <- the biologically real part
+    total               = protocol × selection
+    ```
+    Every non-initial sample has exactly **one** collapse-vs-R0 row: `protocol` if it is in the `empty`
+    group, `total` otherwise — so the empty round is presented **once, under one label**, never as its
+    own selection. `selection` rows are extra, and exist for an arm only where a **round-matched** empty
+    round does (match the empty round to the real round with the same number of transfers, not to R0).
+    An empty round is a **peer** of every cell-line arm: it gets its own group matrix, its own colour,
+    its own C_eff trajectory line and its own UpSet panel. It also gives an **empirical null** for
+    enrichment fold-change and a data-derived `min_reads`.
+
+### Writing the sample table
+
+Four keys per sample, all required. The constraints are not style — `name` and `group` both become
+**paths on disk**, and the cross-reports discover samples by **globbing directories**:
+
+| key | rule | why |
+| --- | --- | --- |
+| `name` | globally unique; `[A-Za-z0-9][A-Za-z0-9._+-]*` — no `/`, no spaces. Must not equal any group name. | it becomes a **directory** *and* the filename stem inside it: `results/umi/<name>/<name>.fused.parquet`, `results/dedup/<name>/<name>.featurecount.parquet`. A group writes `results/umi/<group>.umi_x_sample.mtx` into that **same parent directory**, so names and groups share one namespace on disk — and the reports identify a sample *by its directory name*. |
+| `group` | must be listed in `groups:`; `[A-Za-z0-9][A-Za-z0-9._+-]*`. Two **reserved** names: `initial` (the R0 baseline, exactly one sample) and `empty` (the PCR-only rounds, at most one per round). Everything else is a selection arm. | it becomes a **filename stem** in the directory the reports glob (`results/umi/`, `results/fragvec/`). A `/` in it would create a *subdirectory* there — sitting in exactly the namespace `BASE.glob("*/")` scans for samples. |
+| `round` | an integer, required. R0 = the initial library. | it orders a group's samples within its matrix, and it is what pairs an `empty` round to the real rounds with the **same** transfer/PCR count. |
+| `fastq` | absolute path, and **the file must exist**. | snakemake stats every input even on a dry run — a missing path fails with `MissingInputException` before anything runs. (A relative path resolves against the directory you run snakemake in, not against the config.) |
+
+Two rules the code **cannot** check for you, so you have to know them:
+
+- **Append a new group's rows at the END of `samples:`.** Report colours are assigned in the order a
+  group **first appears** in `samples:` (the `groups:` list never reaches a report). Insert `empty_R2`
+  between `A549_R2` and `MDA_R1` and MDA silently shifts from green to vermillion — in all three
+  reports, with no error.
+- **Keep `samples:` grouped** — one group's rounds contiguous, in ascending round order. Nothing
+  re-sorts them for you.
+
+Everything else **raises at parse time, naming the offending sample**, before any compute: a leftover
+`role:` key; a missing, duplicated or badly-formed `name`; an undeclared or missing `group`; a group
+declared but unused; a missing or non-integer `round`; a group name with a `/` in it or colliding with
+a sample name; two `initial` samples; two `empty` samples in the same round; a `samples:` table whose
+file forgets to declare `groups:`. You will never get a silently wrong result from a bad table — you
+get a message telling you which row to fix.
+
+## Fragment-vector quantification (`fragvec`) — the two-axis readout
+
+The second, **independent** analysis branch off `decode` (a sibling of the `umi` branch — run either,
+or both). A read's **fragment vector** is its sorted set of **payload** `fragment_id`s (anchors excluded;
+`_rc` kept distinct, since a reverse-ligated fragment is a different species). That vector **is** the
+library member — and it is where the statistical power lives:
+
+| level | depth in this data | usable? |
+| --- | --- | --- |
+| UMI (clone) | **~1.0 reads**, 96–99.6% singletons | no — you sample ~10⁻⁶ of the molecule pool |
+| **fragment vector** | **4–22 reads mean; max up to 67,152** | **yes** |
+
+Per sample and vector it counts **two axes** (the CRISPR-UMI convention, Michlits et al. 2017):
+
+- `n_reads` — **abundance**
+- `n_umis` — **incidence**: how many *independent clones* carry the vector
+- `max_reads_per_umi` — the **jackpot detector**
+
+The pair is what makes a call trustworthy. 2,530 reads spread over 2,078 distinct clones is
+reproducible selection; 2,530 reads from *one* clone is a single amplified lineage and must **not** be
+read as enrichment. `rpm` is the **depth-normalised frequency** (reads per million payload reads), which
+is what makes a vector comparable across rounds of different depth — and it is what the trajectories are
+built on. It deliberately does *not* scale by the sample's observed richness: Kuai et al.'s
+`count × total_diversity / total_reads` uses the **library size**, a design constant identical in every
+sample, whereas the *observed* per-sample richness differs per sample (it swings 4.5× here) and is itself
+depth-dependent, so using it would distort the very cross-sample comparison it is meant to enable. A
+*constant* factor only rescales the axis; a *per-sample* one corrupts the trajectory. Counts below
+`min_reads` are **flagged, never
+dropped** — a vector at 3 reads in R1 and 800 in R5 is exactly the hit you want. Sub-vector marginals
+(single fragments, fragment pairs) are emitted as a *lossy denoising view*, never a replacement.
+
+Unlike the per-clone UMI matrix (whose R0 column is ~empty, because R0's sequencing never sampled the
+clones that later win), the **R0 column here is densely populated**, so R5/R0 enrichment is computable.
+
+### ⚠️ Complexity and sequencing depth — read this before comparing any count
+
+Depth varies ~6× across samples here (94k–551k payload reads). **Every richness-style count — distinct
+UMIs, distinct fragment vectors, shared species between samples — grows with depth**, because the harder
+you look the more distinct things you find. Such a count is a property of the *run*, not of the
+*library*, and comparing it across samples of different depth is invalid.
+
+> **Rule of thumb: if a number gets bigger when you sequence more, it is not a property of your library.**
+
+Concretely: A549_R1 appears to have **8.3×** more fragment vectors than A549_R5 — but R1 was sequenced
+4.5× deeper. Rarefied to a common depth the honest ratio is **2.4×**.
+
+Two depth-robust measures are emitted instead (`workflow/scripts/complexity_lib.py`), and the reports
+plot these rather than the raw counts:
+
+- **`c_eff = N(N−1) / Σ nᵢ(nᵢ−1)`** — the effective complexity (inverse-Simpson). It estimates the
+  *pool's* read-collision probability, so it does not inflate with depth. Emitted per sample in both
+  `umi_summary.tsv` (molecular) and `fragvec_summary.tsv` (vector-level). A sample with **no duplicates
+  at all** (an un-bottlenecked `empty` round) yields a 95% **lower bound** — flagged as
+  `c_eff_is_lower_bound`.
+- **Rarefaction** — expected richness at a common depth, `E[distinct] = Σᵢ [1 − (1 − m/N)^nᵢ]`
+  (analytic, deterministic). The cross-sample reports rarefy every sample to the shallowest one.
+
+Columns that remain depth-dependent (`n_vectors`, `n_vectors_ge_min`, `pct_reads_in_vectors_ge_min`) are
+marked ⚠ in the report tables. Note also that `min_reads` is a **raw count** applied across that 6× depth
+spread, so a vector at the same *frequency* can be "signal" in a deep sample and "noise" in a shallow one;
+the principled threshold comes from the `empty` rounds (above).
+
+`workflow/scripts/effective_complexity.py` is a standalone CLI for the same estimator — useful for
+running the protocol/selection decomposition on an arbitrary set of samples without invoking Snakemake.
 
 ## UMI processing (`umi.mode`)
 
@@ -139,8 +287,9 @@ pipeline is unaffected and still counts every read. Per sample `umi/<s>/`:
 - `<s>.umi_species.tsv` — corrected `fused_seq  n_reads` (the matrix substrate).
 - `<s>.umi_summary.tsv` — per-sample filter/correction counts (incl. `dropped_no_payload`).
 
-Per experimental **group** (config `group`), one corrected-UMI × sample matrix with the R0 library as
-the **first column** (no all-sample matrix): `umi/<group>.umi_x_sample.long.parquet` (`fused_umi,
+Per **group** (config `group` — every group except `initial`, the `empty` arm included: it is a peer
+arm, not a special case), one corrected-UMI × sample matrix with the R0 library as the
+**first column** (no all-sample matrix): `umi/<group>.umi_x_sample.long.parquet` (`fused_umi,
 sample, n_reads`; canonical), `.mtx` (Matrix Market triplets), and `.{umis,samples}.tsv` (row/column
 labels). Finally `umi/umi_report_cross.html` — a descriptive QC report (rank-abundance, D50/D90
 complexity, per-group species-overlap UpSet, and validity QC: UMI-group ligand-signature purity vs
@@ -174,13 +323,16 @@ Below, `<tree>` is `dedup` (the UMI stage always QC-filters, so featurecount/rep
 | `clean/<sample>.fastq`, `clean/clean_summary.tsv`                                                             | human-depleted, length-filtered reads + summary                              |
 | `hmm/<adapters>.hmm` (+ hmmpress DB)                                                                          | trained primer HMM                                                           |
 | `preprocess/<sample>/<sample>.full_length.fq` (+ rescued/…/stats/report/bed), `preprocess/batch_summary.tsv` | pychopper outputs                                                            |
-| `decode/<sample>/…` (experimental), `decode_initial/<initial>/…`                                            | LigandFrags2 decode (fragments/umis/fused/trimmed parquet, fused_reads.fq, ligateddna.log) |
-| `dedup/<sample>/…` (experimental), `dedup_initial/<initial>/…`                                              | the same artifacts, QC-filtered (and, with dedup on, reduced to one representative read per UMI molecule); `ligateddna.log` gains a provenance block |
+| `decode/<sample>/…` (every non-`initial` sample), `decode_initial/<initial>/…`                                            | LigandFrags2 decode (fragments/umis/fused/trimmed parquet, fused_reads.fq, ligateddna.log) |
+| `dedup/<sample>/…` (every non-`initial` sample), `dedup_initial/<initial>/…`                                              | the same artifacts, QC-filtered (and, with dedup on, reduced to one representative read per UMI molecule); `ligateddna.log` gains a provenance block |
 | `dedup/<sample>/<sample>.{umi_counts,umi_clusters}.tsv`, `.umi_audit.parquet`, `.umi_dedup_summary.tsv`        | that sample's UMI QC, beside the data it describes: UMI counts, starcode clusters (empty unless dedup on), a one-row-per-input-read audit, and its summary row |
 | `dedup/umi_dedup_summary.tsv`                                                                                 | all samples: reads in → reads kept (molecules out with dedup on), drop classes, duplicate rate |
 | `umi/<sample>/<sample>.fused.parquet`, `.umi_species.tsv`, `.umi_summary.tsv` (+ `umi_initial/`)             | (mode `correct`) corrected UMIs over **payload-bearing reads only**: per-read `fused_seq_corrected` + `umi_read_count`, the species→count table, and filter/correction counts |
-| `umi/<group>.umi_x_sample.{long.parquet,mtx,umis.tsv,samples.tsv}`                                            | (mode `correct`) per-group corrected-UMI × sample read-count matrix, R0 library as the first column |
+| `umi/<group>.umi_x_sample.{long.parquet,mtx,umis.tsv,samples.tsv}`                                            | (mode `correct`) one per group except `initial` (**`empty` included**): corrected-UMI × sample read-count matrix, R0 library as the first column |
 | `umi/umi_report_cross.html`                                                                                   | (mode `correct`) cross-sample UMI QC report (abundance, species overlap, validity) |
+| `fragvec/<sample>/<sample>.fragvec_counts.parquet` (+ `.fragvec_clones`, `.subvec_counts`, `.fragvec_summary.tsv`) | (fragvec) per fragment vector: `n_reads` (abundance), `n_umis` (incidence = independent clones), `max_reads_per_umi` (jackpot), `rpm` (depth-normalised frequency — the cross-sample comparable value), `is_noise` |
+| `fragvec/<group>.fragvec_x_sample.{long.parquet,reads.mtx,umis.mtx,vectors.tsv,samples.tsv}`                  | (fragvec) one per group except `initial` (**`empty` included**): vector × sample matrices, BOTH axes, R0 first (and genuinely populated) |
+| `fragvec/fragvec_report_cross.html`                                                                           | (fragvec) complexity collapse, incidence-vs-abundance jackpot control, enrichment trajectories, cross-arm clone stratification |
 | `<tree>/<sample>/<sample>.featurecount.parquet` + `.summary.tsv`                                              | per-read feature counts                                                      |
 | `<tree>/<sample>/<sample>.featurecount_report.html`                                                           | per-sample interactive report                                                |
 | `<tree>/cross_sample_featurecount_report.html`                                                                | cross-sample comparison report                                               |

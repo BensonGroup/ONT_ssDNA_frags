@@ -26,34 +26,39 @@ rule report_sample:
 #
 # EVERY sample, including the R0 `initial` library. The reports only ever look up names they globbed
 # out of the non-initial tree, so the extra row is inert for them -- but it means the baseline's
-# group/round/role come from the config like everyone else's, instead of each report hardcoding its
-# own name for it (they disagreed: two said "initial", one said "library"). It also lets
+# group/round come from the config like everyone else's, instead of each report hardcoding its own
+# name for it (they disagreed: two said "initial", one said "library"). It also lets
 # `rule umi_complexity` read the whole sample table from one file.
 #
-# Schema: name<TAB>group<TAB>round<TAB>idx<TAB>role   -- `idx` is config order, so groups appear as
-# configured. APPEND-ONLY: see the warning in report_lib.load_meta() -- inserting a column before
-# `idx` silently degrades the sort key and makes the cell lines interleave by round.
+# The `group` string decides EVERYTHING downstream: `initial` is the R0 baseline (excluded from the
+# report columns by report_lib.group_order), `empty` is the PCR-only arm, and every other group is a
+# selection arm. There is no second axis -- one field picks the tree, the matrix, the colour and the
+# collapse kind.
+#
+# Schema: name<TAB>group<TAB>round<TAB>idx   -- `idx` is RAW config sample order (not group-major),
+# so a group's palette slot follows where it FIRST APPEARS in `samples:`. APPEND-ONLY: see the
+# warning in report_lib.load_meta() -- inserting a column before `idx` silently degrades the sort
+# key and makes the cell lines interleave by round.
 rule cross_sample_metadata:
     output:
         f"{OUTDIR}/{{crossbase}}/sample_metadata.tsv",
     params:
-        rows=[(n, str(SAMPLE[n].get("group", "") or ""), SAMPLE[n].get("round"), i,
-               SAMPLE[n]["role"])
+        rows=[(n, str(SAMPLE[n].get("group", "") or ""), SAMPLE[n].get("round"), i)
               for i, n in enumerate(SAMPLES)],
     run:
         with open(output[0], "w") as out:
-            out.write("name\tgroup\tround\tidx\trole\n")
-            for name, group, rnd, idx, role in params.rows:
+            out.write("name\tgroup\tround\tidx\n")
+            for name, group, rnd, idx in params.rows:
                 r = "" if rnd is None else rnd
-                out.write(f"{name}\t{group}\t{r}\t{idx}\t{role}\n")
+                out.write(f"{name}\t{group}\t{r}\t{idx}\n")
 
 
 def cross_inputs(wildcards):
     """Every non-initial sample's artifacts in the requested tree, plus the initial library's when
     the R0 baseline is enabled. The cross script globs L2F_BASE=<crossbase>/*/ (directories only)
     and groups the samples it finds by config `group`; declaring every non-initial sample here
-    keeps that glob and the DAG in sync (previously only `experimental` samples were declared,
-    which raced). The baseline lives in the sibling `<crossbase>_initial/` tree — never globbed —
+    keeps that glob and the DAG in sync (a stricter subset was declared once, and it raced).
+    The baseline lives in the sibling `<crossbase>_initial/` tree — never globbed —
     and is injected separately via L2F_R0_STEM, so the two always move in lockstep."""
     base = wildcards.crossbase
     parts = [".featurecount.parquet", ".featurecount.summary.tsv", ".umis.parquet",

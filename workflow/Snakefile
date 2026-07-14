@@ -39,7 +39,7 @@ rule all:
         # of the fragment reports above. The two complexity TSVs are listed even though the report
         # pulls them in transitively — they are outputs in their own right and survive if the report
         # is ever switched off.
-        *([f"{OUTDIR}/umi/{g}.umi_x_sample.mtx" for g in GROUPS_EXP] if UMI_CORRECT_ON else []),
+        *([f"{OUTDIR}/umi/{g}.umi_x_sample.mtx" for g in GROUPS] if UMI_CORRECT_ON else []),
         *([f"{OUTDIR}/umi/umi_complexity.tsv",
            f"{OUTDIR}/umi/umi_collapse.tsv"] if UMI_CORRECT_ON else []),
         *([f"{OUTDIR}/umi/umi_report_cross.html"] if UMI_CORRECT_ON else []),

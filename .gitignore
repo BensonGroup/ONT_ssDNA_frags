@@ -15,4 +15,8 @@ __pycache__/
 # OS / editor cruft
 .DS_Store
 *~
-.claude/scratch/
+
+# Claude Code working dir: scratch output, plan files, local settings. None of it is repo history —
+# what a plan decided ends up in the code and the commit message. Plans are still kept here (never
+# overwritten: each planning round gets its own dated+versioned file) so they can be re-read locally.
+.claude/

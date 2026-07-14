@@ -39,16 +39,34 @@ TWO WAYS TO RUN IT
 
   2. By hand, off-workflow -- `--fused` re-derives the counts from a `<sample>.fused.parquet`, which
      is the ONLY way to run this on a sample that never went through `umi_correct`. That is exactly
-     the empty/PCR-only control-round case, so this path stays:
+     the empty / PCR-only round's case, so this path stays:
 
          effective_complexity.py --fused NAME=PATH [...] [--umi-col fused_seq]
                                  [--baseline NAME] [--pair EMPTY=REAL ...]
 
-    --baseline   the R0 library, used to report the total collapse
+    --baseline   the R0 library, used to report the collapse of every other sample against it
     --pair       decompose a collapse into PROTOCOL vs SELECTION by matching an empty (no-cell) round
                  to the real round with the SAME number of transfers/PCR cycles, e.g.
                      --pair empty_R5=A549_R5
-                 With --meta this pairing is derived automatically from `role: control` + `round`.
+                 With --meta this pairing is derived automatically from `group: empty` + `round`.
+
+THE THREE COLLAPSE KINDS, AND THE ONE-ROW INVARIANT
+    There is no `role` field: the sample's `group` decides everything, and `empty` is a reserved
+    group name (report_lib.EMPTY_GROUP) meaning "the PCR-only / no-cell round".
+
+        protocol   C_eff(R0)       / C_eff(empty_Rk)   emitted on the EMPTY samples only
+        total      C_eff(R0)       / C_eff(sample)     emitted on every EXPERIMENTAL sample
+        selection  C_eff(empty_Rk) / C_eff(sample)     experimental samples WITH a round-matched empty
+
+    EVERY NON-INITIAL SAMPLE HAS EXACTLY ONE COLLAPSE-VS-R0 ROW: `protocol` if it is in the `empty`
+    group, `total` otherwise. `selection` rows are EXTRA. The empty round is therefore presented ONCE,
+    under ONE label -- it never also carries a `total`, and it is never its own `selection` (which
+    would be empty/empty = exactly 1.0, a number divided by itself printed as a measurement).
+    `total = protocol x selection` still holds exactly, by cancellation of C_eff(empty), and is now
+    derivable from three DISTINCT rows rather than asserted across duplicates.
+
+    A consumer that wants "the collapse vs R0" must therefore key on `kind in (total, protocol)`, not
+    on `total` alone -- the two are mutually exclusive per sample, so the lookup is unambiguous.
 
 The human-readable table always goes to stdout, including in --out-tsv mode -- Snakemake captures it
 into the rule's log, so the provenance of every emitted number is free.
@@ -63,7 +81,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from complexity_lib import c_eff as _c_eff       # the single source of truth for the estimator
 from complexity_lib import summarize as _summarize
-from report_lib import load_meta
+from report_lib import BASELINE_GROUP, EMPTY_GROUP, load_meta
 
 TOP_K = 10          # the "top-lineage share" in clarification.md 8.5
 
@@ -135,27 +153,70 @@ def _ratio(num, den):
     """
     if not num["_c"] or not den["_c"] or math.isinf(den["_c"]) or math.isinf(num["_c"]):
         return None, "?"
-    r = num["_c"] / den["_c"]
+    r = _round_ratio(num["_c"] / den["_c"])
     nb, db = num["c_eff_is_lower_bound"], den["c_eff_is_lower_bound"]
     if nb and db:
-        return round(r, 4), "?"
+        return r, "?"
     if nb:
-        return round(r, 4), ">"
+        return r, ">"
     if db:
-        return round(r, 4), "<"
-    return round(r, 4), ""
+        return r, "<"
+    return r, ""
+
+
+def _round_ratio(r):
+    """Round a collapse ratio for reading -- but NEVER down to zero.
+
+    `round(r, 4)` is fine at or above 1x (a collapse), and destroys the measurement below it: a sub-1
+    ratio means complexity HELD OR ROSE, and an un-bottlenecked `empty` round (no duplicate reads, a
+    huge C_eff) can push C_eff(R0)/C_eff(empty) to 1e-5 or smaller. Flattened to 0.0 that reads as a
+    total collapse -- the exact opposite of what happened -- and downstream truthiness tests would
+    then blank the cell entirely. Keep 4 SIGNIFICANT figures below 1 instead of 4 decimal places.
+    """
+    return round(r, 4) if r >= 1 else float(f"{r:.4g}")
+
+
+def _empty_samples(recs, pairs):
+    """The names of the empty (PCR-only / no-cell) rounds.
+
+    Two entry points name the empty round two different ways, so both are honoured and UNIONED:
+
+      * the workflow / `--meta` path -- the sample's config `group` IS the reserved name `empty`.
+        There is no `role` field any more; the group decides everything.
+      * the off-workflow `--pair EMPTY=REAL` path -- there is no config and usually no `--meta`, so
+        the sample's `group` is blank. The empty round is then, by definition, whatever was named on
+        the LEFT of a `--pair`. Without this, `--pair` would emit no `protocol` row at all, which is
+        the one number that flag exists to produce.
+
+    Union, not either-or: a `group: empty` sample must NEVER be handed a `total` row, whichever flag
+    the caller reached for.
+    """
+    empties = {n for n, r in recs.items() if r.get("group") == EMPTY_GROUP}
+    if pairs is not None:
+        empties |= {e for e in pairs.values() if e in recs}
+    return empties
 
 
 def collapse_rows(recs, baseline, pairs=None):
-    """Collapse of the pool relative to the R0 library, decomposed where a control round exists.
+    """Collapse of the pool relative to the R0 library, decomposed where an empty round exists.
 
-        total      C_eff(R0)    / C_eff(sample)
-        protocol   C_eff(R0)    / C_eff(empty)    -- transfers + PCR alone, no biology
-        selection  C_eff(empty) / C_eff(sample)   <- the biologically real part
+        protocol   C_eff(R0)       / C_eff(empty_Rk)   on the EMPTY samples -- transfers + PCR alone
+        total      C_eff(R0)       / C_eff(sample)     on every EXPERIMENTAL sample
+        selection  C_eff(empty_Rk) / C_eff(sample)     <- the biologically real part
 
-    PAIRING RULE: a control is matched to a real sample BY ROUND, and one control fans out to EVERY
-    experimental sample of that round -- an empty R5 has seen the same transfers and PCR cycles as
-    both arms' R5, so it is the null for both. Two controls in the same round is an error, not a
+    THE INVARIANT: every non-initial sample gets exactly ONE of {total, protocol}. The empty round's
+    collapse vs R0 IS the protocol collapse, so it is labelled `protocol` and stated ONCE -- not
+    restated as a duplicate `protocol` row hung off every experimental sample (which is what this
+    used to do), and never as a `total`.
+
+    THE TRAP this guards: the empty round is itself a round-k sample, so a naive "match each sample
+    to the empty of the same round" makes it ITS OWN match -- a `selection` row of empty/empty =
+    exactly 1.0, a number divided by itself rendered as a real measurement. The gate is on the GROUP
+    (`_empty_samples`), not on the round.
+
+    PAIRING RULE: an empty round is matched to a real sample BY ROUND, and one empty fans out to
+    EVERY experimental sample of that round -- an empty R5 has seen the same transfers and PCR cycles
+    as both arms' R5, so it is the null for both. Two empties in the same round is an error, not a
     coin-flip: which one is the null for that round is not something this script may guess.
 
     NOTE this is a DESCRIPTIVE decomposition, not a causal one (clarification.md 7): it attributes
@@ -165,33 +226,52 @@ def collapse_rows(recs, baseline, pairs=None):
     if base is None:
         return []
 
-    controls = {}
-    if pairs is None:                                    # derive from role+round (the --meta path)
+    empties = _empty_samples(recs, pairs)
+
+    by_round = {}
+    if pairs is None:                        # derive the pairing from group+round (the --meta path)
         for n, r in recs.items():
-            if r.get("role") != "control":
+            if n not in empties:
                 continue
             rnd = r.get("round")
-            if rnd in controls:
+            if rnd in by_round:
+                # KEPT even though common.smk now rejects this at PARSE time: the off-workflow
+                # `--fused --meta` path never goes near snakemake or the config, so this is still
+                # the only guard there.
                 raise SystemExit(
-                    f"[FATAL] control samples {controls[rnd]!r} and {n!r} are both round {rnd}. "
-                    f"A control is the null FOR ITS ROUND; which of the two is that null is not "
+                    f"[FATAL] empty-round samples {by_round[rnd]!r} and {n!r} are both round {rnd}. "
+                    f"An empty round is the null FOR ITS ROUND; which of the two is that null is not "
                     f"something this script may guess. Give them distinct rounds.")
-            controls[rnd] = n
+            by_round[rnd] = n
+
+        # WARN, do not raise. An empty round at a round no arm ran is not a broken config -- it is a
+        # legitimate thing to have sequenced. But it then yields ZERO selection rows, and without
+        # this line nothing would say why the decomposition is missing.
+        exp_rounds = {r.get("round") for n, r in recs.items()
+                      if n != baseline and n not in empties and r.get("group") != BASELINE_GROUP}
+        for rnd, n in by_round.items():
+            if rnd not in exp_rounds:
+                sys.stderr.write(
+                    f"[WARN] empty round {n!r} is round {rnd}, but no experimental sample is at "
+                    f"round {rnd}. It still gets its own `protocol` collapse row; it is simply the "
+                    f"null for nothing, so NO `selection` rows are derived from it.\n")
+
     rows = []
     for n, r in recs.items():
-        if n == baseline or r.get("role") in ("initial", "control"):
-            continue
-        empty = pairs.get(n) if pairs is not None else controls.get(r.get("round"))
-        ctl = recs.get(empty) if empty else None
+        if n == baseline or r.get("group") == BASELINE_GROUP:
+            continue                                     # the R0 library has no collapse vs itself
         # `sample` is the row's SUBJECT (whose collapse is being decomposed); `num`/`den` name the two
-        # samples the ratio is actually taken between, which for `protocol` is NOT the subject --
-        # it is R0 vs the empty round. Naming them explicitly is the difference between a readable
-        # row and one that claims to compare two samples it never touched.
-        for kind, num, den in (("total", base, r),
-                               ("protocol", base, ctl),
-                               ("selection", ctl, r)):
-            if num is None or den is None:
-                continue                                 # no control for this round -> no decomposition
+        # samples the ratio is actually taken between. Naming them explicitly is the difference
+        # between a readable row and one that claims to compare two samples it never touched.
+        if n in empties:
+            kinds = [("protocol", base, r)]              # its collapse vs R0 IS the protocol collapse
+        else:
+            kinds = [("total", base, r)]
+            empty = pairs.get(n) if pairs is not None else by_round.get(r.get("round"))
+            ctl = recs.get(empty) if empty else None
+            if ctl is not None:                          # a round-matched empty round exists
+                kinds.append(("selection", ctl, r))
+        for kind, num, den in kinds:
             ratio, bound = _ratio(num, den)
             rows.append({"group": r.get("group", ""), "round": r.get("round", ""), "sample": n,
                          "kind": kind, "num": num["name"], "den": den["name"],
@@ -200,9 +280,11 @@ def collapse_rows(recs, baseline, pairs=None):
 
 
 # ------------------------------------------------------------------------------------------ output
-TSV_COLS = ["name", "group", "round", "role", "n_reads", "n_distinct", "dup_pairs",
+TSV_COLS = ["name", "group", "round", "n_reads", "n_distinct", "dup_pairs",
             "collision_prob", "c_eff", "c_eff_is_lower_bound", "n_over_c_eff",
             "max_n_i", "top10_share_of_S", "rarefied_to", "n_distinct_rarefied"]
+# UNCHANGED by the group-only sample model, deliberately: `kind` + `sample` already say everything a
+# consumer needs (which of the three collapses this is, and whose). Add no column, add no kind.
 COLLAPSE_COLS = ["group", "round", "sample", "kind", "num", "den", "ratio", "ratio_bound"]
 
 
@@ -256,10 +338,17 @@ def print_collapse(rows):
         tag = {"total": "total collapse    ",
                "protocol": "PROTOCOL collapse ",
                "selection": "SELECTION collapse"}[r["kind"]]
-        note = {"protocol": "   (transfers + PCR alone)",
+        # The protocol line is the EMPTY ROUND'S OWN collapse vs R0 -- it is that sample's one and
+        # only vs-R0 row, standing exactly where an experimental sample's `total` stands. Saying so
+        # here is what stops it being read as a fourth, free-floating number.
+        note = {"protocol": "   <- the empty round's OWN collapse vs R0 (transfers + PCR, no cells)",
                 "selection": "   <- the biologically real part"}.get(r["kind"], "")
         pair = f"{r['num']} -> {r['den']}"
         print(f"  {tag} {pair:<48} {r['ratio_bound']}{fold(r['ratio']):>12}{note}")
+    if any(r["kind"] == "protocol" for r in rows):
+        print("\n  Every non-initial sample has exactly ONE row above vs R0: `protocol` for the empty")
+        print("  round, `total` for everything else. total = protocol x selection (C_eff(empty)")
+        print("  cancels), so the three are one number stated three ways, not three measurements.")
 
 
 # --------------------------------------------------------------------------------------------- cli
@@ -273,8 +362,8 @@ def main(argv):
     ap.add_argument("--umi-col", default="fused_seq",
                     help="--fused only: fused_seq (raw) | fused_seq_corrected (after the umi/ branch)")
     ap.add_argument("--meta", default=None,
-                    help="sample_metadata.tsv (name/group/round/idx/role); supplies group+round+role "
-                         "and lets the control pairing be derived instead of spelled out with --pair")
+                    help="sample_metadata.tsv (name/group/round/idx); supplies group+round and lets "
+                         "the empty-round pairing be derived instead of spelled out with --pair")
     ap.add_argument("--baseline", default=None, help="name of the R0 library, for the total collapse")
     ap.add_argument("--pair", nargs="*", default=None, metavar="EMPTY=REAL",
                     help="decompose protocol vs selection explicitly (overrides the --meta pairing)")
@@ -309,7 +398,7 @@ def main(argv):
     for name, c in counts.items():
         r = measure(name, c, rarefy_to=m)
         mm = meta.get(name, {})
-        r["group"], r["round"], r["role"] = mm.get("group", ""), mm.get("round", ""), mm.get("role", "")
+        r["group"], r["round"] = mm.get("group", ""), mm.get("round", "")
         recs[name] = r
 
     print_table(recs)

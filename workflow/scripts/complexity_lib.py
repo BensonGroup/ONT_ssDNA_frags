@@ -140,7 +140,15 @@ def summarize(counts, rarefy_to=None):
         "collision_prob": collision_prob(counts),   # sum p_i^2 -- THE unbiased, depth-robust quantity
         "c_eff": None if C == float("inf") else round(C, 1),   # its reciprocal (biased up when pairs few)
         "c_eff_is_lower_bound": lower,
-        "n_over_c_eff": None if C in (0, float("inf")) else round(N / C, 4),
+        # SIGNIFICANT FIGURES, not fixed decimals. round(x, 4) fabricates a ZERO for exactly the sample
+        # this field matters most on: an un-bottlenecked empty/PCR-only round has no duplicates, so its
+        # c_eff is enormous, so N/c_eff is ~4e-5 -- and round(4.071e-05, 4) is 0.0. That zero then
+        # travels into the TSV and out into the report as "0.000", which reads as "you sampled none of
+        # the pool" instead of "you sampled a ten-thousandth of it". A destroyed value cannot be
+        # recovered downstream, so it must not be destroyed here.
+        # (When c_eff is only a LOWER bound, this ratio is correspondingly an UPPER bound -- read it
+        # next to c_eff_is_lower_bound, which the reports render as a `>` on c_eff itself.)
+        "n_over_c_eff": None if C in (0, float("inf")) else float(f"{N / C:.4g}"),
     }
     if rarefy_to is not None:
         out["rarefied_to"] = rarefy_to

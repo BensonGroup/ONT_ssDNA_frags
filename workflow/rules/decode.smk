@@ -1,6 +1,7 @@
-# Decode ligated-DNA constructs with LigandFrags2 (from scripts/06). The `{decbase}` wildcard
-# is `decode` for experimental samples and `decode_initial` for the initial library; it is only
-# ever requested at the value decbase(sample) returns, so no sample is decoded into both trees.
+# Decode ligated-DNA constructs with LigandFrags2 (from scripts/06). The `{decbase}` wildcard is
+# `decode` for every non-baseline sample (the `empty` arm included) and `decode_initial` for the
+# initial library; it is only ever requested at the value decbase(sample) returns, so no sample is
+# decoded into both trees.
 # The log body reproduces scripts/06 verbatim (esp. the `expected :` line) so ligand_vocab.parse_log
 # still recovers the per-sample expected CSV. RAYON handles per-process threading; Snakemake -j
 # replaces the old JOBS/xargs fan-out, and the DAG replaces the "skip if exists" guard.

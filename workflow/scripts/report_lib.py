@@ -1,19 +1,30 @@
 #!/usr/bin/env python
-"""Shared presentation layer for the three cross-sample reports.
+"""The shared GROUP VOCABULARY, and the presentation layer for the three cross-sample reports.
 
-WHAT LIVES HERE: the things that must AGREE across `build_umi_report_cross.py`,
-`build_fragvec_report_cross.py` and `build_featurecount_report_cross.py` -- html escaping, figure
-embedding, and (the reason this module exists) the GROUP layer: the config `group` of a sample --
-its cell line -- is the organising dimension of every diagram, and a cell line must be the same
-colour in every report.
+This module is TWO things, and the second one is newer and easy to miss:
+
+1. THE VOCABULARY. `BASELINE_GROUP` / `EMPTY_GROUP` are the two reserved group names, and they are
+   the ONLY definition of them anywhere. The `group` field of a config sample decides everything --
+   which tree a sample is decoded into, whether it forms a group matrix, what its collapse row is
+   called (there is no `role` field; it was removed). `common.smk` imports these two names FROM
+   HERE, so they are workflow vocabulary, not just report vocabulary.
+
+2. THE PRESENTATION LAYER. The things that must AGREE across `build_umi_report_cross.py`,
+   `build_fragvec_report_cross.py` and `build_featurecount_report_cross.py` -- html escaping, figure
+   embedding, and the GROUP layer: a group is the organising dimension of every diagram, and a group
+   must be the same colour in every report.
+
+HARD INVARIANT -- THIS MODULE MUST STAY STDLIB-ONLY. Because of (1) it is now imported at
+WORKFLOW-PARSE TIME by `common.smk`, i.e. under the `snakemake` pixi env, which has NO plotly and NO
+polars. Add `import plotly` (or polars, numpy, ...) at its top and THE ENTIRE WORKFLOW STOPS PARSING
+-- not one rule, all of it, before any job is scheduled. `fig_html` only calls a method on the figure
+it is handed; keep it that way. The corollary benefit: the palette self-test at the bottom runs under
+plain `python3 report_lib.py`.
 
 WHAT DOES NOT LIVE HERE: `style()` and the CSS. They only look duplicated. The featurecount report
 uses transparent backgrounds, different margins, its own axis colours, and an external CSS kit with
 a theme toggle; the other two use `plotly_white` and an inline `_STYLE`. Unifying them would
 silently restyle two reports for no benefit. Leave each report's own look alone.
-
-Dependency-free on purpose (no plotly, no polars) -- `fig_html` only calls a method on the figure
-it is handed -- so the palette self-test at the bottom runs under plain `python3 report_lib.py`.
 """
 from __future__ import annotations
 
@@ -48,9 +59,22 @@ GROUP_PALETTE = [
 BASELINE_GREY = "#7d8590"
 GREY = "#7d8590"            # neutral marks (expected-by-chance bars, reference lines)
 
-# The config `group` of the `role: initial` sample (config/config.yaml). It is a baseline, not a
-# cell line, so it never consumes a palette slot -- see group_color().
+# ------------------------------------------------------------------------- the reserved group names
+# The two RESERVED values of a sample's config `group` (config/config.yaml). `common.smk` imports
+# both from here and validates them at parse time -- exactly one sample may be `initial`, and a
+# group name that is not in the declared `groups:` list RAISES. They are the whole sample model:
+# there is no `role` field, the group decides everything.
+#
+# `initial` -- the R0 library. A shared baseline, not a selection arm: it is decoded into its own
+#     `*_initial/` tree and it never consumes a palette slot (see group_color()).
+# `empty`   -- the PCR-only / no-cell rounds. A PEER of every experimental arm in every respect: its
+#     own group matrix, its own palette slot, its own C_eff trajectory line, its own UpSet panel. It
+#     is special in exactly ONE place -- the collapse table, where its collapse vs R0 is labelled
+#     `protocol` rather than `total`, because with no cells it measures what the plumbing cost. If
+#     you find yourself writing `if group == EMPTY_GROUP` inside a figure function, the design has
+#     failed.
 BASELINE_GROUP = "initial"
+EMPTY_GROUP = "empty"
 
 
 # ----------------------------------------------------------------------------------- html helpers
@@ -74,18 +98,22 @@ def _int(x, default=0):
 
 
 def load_meta(path):
-    """The config-derived sample table -> {name: {group, round, idx, role}}.
+    """The config-derived sample table -> {name: {group, round, idx}}.
 
     Schema (written by `rule cross_sample_metadata`, reports.smk):
 
-        name <TAB> group <TAB> round <TAB> idx <TAB> role
+        name <TAB> group <TAB> round <TAB> idx
+
+    There is NO `role` column: the group decides everything (see the reserved names above).
 
     APPEND-ONLY. Never insert a column before `idx`: `idx` is the config-order sort key, and a
     shifted parse degrades it to a constant, which collapses the sort so the cell lines interleave
     by round instead of forming the contiguous blocks group_spans() needs. New columns go on the end,
     where a short-field parse leaves them empty and everything else still lines up.
 
-    A legacy 4-column file (no `role`) still parses: role is inferred from the round.
+    A STALE 5-column file (the old `... <TAB> idx <TAB> role`) still parses, and its trailing `role`
+    is DROPPED by the [:4] slice -- narrowing is safe precisely because `role` was the last column,
+    so nothing before it shifts. No migration shim, no inference: role is gone, not renamed.
     Returns {} when the file is absent -- every caller has a name-parsing fallback.
     """
     meta = {}
@@ -94,14 +122,12 @@ def load_meta(path):
     for i, line in enumerate(Path(path).read_text().splitlines()):
         if i == 0 or not line.strip():           # header / blanks
             continue
-        f = [x.strip() for x in (line.split("\t") + [""] * 5)[:5]]
-        name, group, rnd, idx, role = f
-        r = _int(rnd, 0)
+        f = [x.strip() for x in (line.split("\t") + [""] * 4)[:4]]
+        name, group, rnd, idx = f
         meta[name] = {
             "group": group or name,
-            "round": r,
+            "round": _int(rnd, 0),
             "idx": _int(idx, i),
-            "role": role or ("initial" if r == 0 else "experimental"),
         }
     return meta
 
@@ -119,11 +145,18 @@ def group_order(samples, key="group"):
         key = "group"
     else:
         items = samples
-    # Drop the baseline by ROLE where we know it (a load_meta dict carries it) and by NAME otherwise
-    # (a discovered sample list carries `is_baseline`, and BASELINE_GROUP is the last-resort
-    # contract for a caller that has neither).
-    items = [s for s in items
-             if s.get("role") != "initial" and not s.get("is_baseline")]
+    # The baseline is dropped by GROUP NAME ALONE, and that is now the only filter needed.
+    #
+    # WHY THIS IS SOUND -- read before "simplifying" the reservation away. `initial` is a RESERVED
+    # group name, validated at parse time by common.smk: exactly one sample may carry it, and an
+    # undeclared group raises. So `group == BASELINE_GROUP` <=> "this is the R0 baseline", for every
+    # caller: a load_meta() dict (group comes from the validated config) and a discovered sample list
+    # alike (both cross reports inject their baseline row with the literal group/line "initial").
+    #
+    # It was NOT sound before this refactor, and that is the trap: `group` was then a free-form
+    # string, so the ROLE filter was the real guard and this line was only a backstop. Un-reserve
+    # `initial` -- let it become just another group name -- and the baseline silently reappears as a
+    # selection arm here, stealing palette slot 0 and shifting every cell line's colour by one.
     return [g for g in dict.fromkeys(s.get(key) for s in items) if g and g != BASELINE_GROUP]
 
 
@@ -319,5 +352,18 @@ if __name__ == "__main__":   # python3 report_lib.py
     assert group_dividers(s) == [0.5, 2.5]
     assert first_of_group(s) == [True, True, False, True]
     assert group_order(s) == ["A", "B"], "group_order must drop the baseline"
+
+    # ---- the group-only sample model (no `role` field anywhere in these dicts) ----------------
+    # `empty` is a PEER, not a baseline: it DOES consume a palette slot, in declared order.
+    assert group_color(["A549", "MDA", EMPTY_GROUP])[EMPTY_GROUP] == GROUP_PALETTE[2], \
+        "the empty arm is a peer group -- it must take a palette slot"
+    assert group_color(["A549", "MDA", EMPTY_GROUP])["A549"] == GROUP_PALETTE[0], \
+        "adding the empty arm must not shift the cell lines' colours"
+    # THE REGRESSION THE REFACTOR RESTS ON: the baseline is dropped and the empty arm is KEPT with
+    # NO `role` key present on either dict. Put `role` back and this still passes -- which is the
+    # point: nothing here may depend on it.
+    assert group_order([{"group": BASELINE_GROUP}, {"group": EMPTY_GROUP}]) == [EMPTY_GROUP], \
+        "group_order must drop the baseline BY GROUP NAME and keep the empty arm"
+    assert load_meta(None) == {}, "a missing metadata TSV is not an error"
     print("report_lib self-test OK" if good else "report_lib self-test: PALETTE BELOW FLOOR")
     raise SystemExit(0 if good else 1)

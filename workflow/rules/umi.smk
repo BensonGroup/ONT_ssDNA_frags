@@ -10,11 +10,11 @@
 
 
 def _umi_src_stem(wc):
-    """The decode stem feeding a umi/ stem, with the role<->tree guard (mirrors _dedup_src_stem)."""
-    want = umibase(wc.sample)                        # role -> umi | umi_initial
+    """The decode stem feeding a umi/ stem, with the group<->tree guard (mirrors _dedup_src_stem)."""
+    want = umibase(wc.sample)                        # group -> umi | umi_initial
     if wc.umibase != want:
         raise ValueError(
-            f"sample {wc.sample!r} (role {SAMPLE[wc.sample]['role']!r}) belongs in "
+            f"sample {wc.sample!r} (group {SAMPLE[wc.sample]['group']!r}) belongs in "
             f"{want}/, not {wc.umibase}/")
     src = "decode_initial" if wc.umibase == "umi_initial" else "decode"
     return f"{OUTDIR}/{src}/{wc.sample}/{wc.sample}"
@@ -56,9 +56,10 @@ rule umi_correct:
         """
 
 
-# One corrected-UMI x sample matrix per experimental group: the R0 initial library is the FIRST
-# column, then the group's rounds in order (group_samples()). Emits a long parquet + Matrix Market
-# + row/col label files. No all-sample matrix.
+# One corrected-UMI x sample matrix per group (GROUPS = every group but the R0 baseline -- the
+# `empty` arm is a PEER and gets its own matrix): the R0 initial library is the FIRST column, then
+# the group's rounds in order (group_samples()). Emits a long parquet + Matrix Market + row/col
+# label files. No all-sample matrix.
 rule umi_matrix:
     input:
         species=lambda wc: [f"{umi_stem(s)}.umi_species.tsv" for s in group_samples(wc.umigroup)],
@@ -68,7 +69,9 @@ rule umi_matrix:
         umis=f"{OUTDIR}/umi/{{umigroup}}.umi_x_sample.umis.tsv",
         samples=f"{OUTDIR}/umi/{{umigroup}}.umi_x_sample.samples.tsv",
     wildcard_constraints:
-        umigroup="|".join(re.escape(g) for g in GROUPS_EXP),
+        # GROUPS_RE, not `"|".join(GROUPS)`: with no non-baseline groups the latter is the EMPTY regex,
+        # which MATCHES THE EMPTY STRING, making `results/umi/.umi_x_sample.mtx` matchable. See common.smk.
+        umigroup=GROUPS_RE,
     params:
         samples=lambda wc: ",".join(group_samples(wc.umigroup)),
         tsvs=lambda wc: ",".join(f"{umi_stem(s)}.umi_species.tsv" for s in group_samples(wc.umigroup)),
@@ -109,7 +112,7 @@ rule umi_complexity:
     log:
         f"{OUTDIR}/umi/umi_complexity.log",
     params:
-        # NAME=PATH pairs; the script keys group/round/role off NAME via the metadata TSV
+        # NAME=PATH pairs; the script keys group/round off NAME via the metadata TSV
         species=[f"{s}={os.path.abspath(umi_stem(s))}.umi_species.tsv"
                  for s in [INITIAL] + NONINITIAL],
         baseline=INITIAL,
@@ -129,7 +132,7 @@ rule umi_complexity:
 # Cross-sample UMI report: effective complexity (C_eff trajectory + collapse), abundance
 # (rank-abundance, D50/D90), species overlap (UpSet per group), and validity QC (UMI-group
 # ligand-signature purity vs size, collision null model). Every figure is coloured by the config
-# `group` (cell line). Discovers experimental samples by globbing umi/*/; the R0 baseline comes from
+# `group` (cell line). Discovers non-initial samples by globbing umi/*/; the R0 baseline comes from
 # the sibling umi_initial/ tree via L2F_R0_STEM (as the featurecount cross report does). Decode
 # fragments feed the purity QC.
 #
