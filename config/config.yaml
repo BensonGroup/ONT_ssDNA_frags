@@ -120,9 +120,9 @@ report:
 #
 # Per-sample keys (all four required):
 #   name  -- globally unique. It becomes a DIRECTORY and the filename stem inside it
-#            (results/umi/<name>/<name>.fused.parquet), so: no '/', no spaces, and it may not equal a
-#            group name (group matrices are written as results/umi/<group>.umi_x_sample.mtx, i.e. into
-#            that same parent directory -- names and groups share one namespace on disk).
+#            (results/umi/<name>/<name>.fused.parquet), so it must be path-safe: no '/', no spaces.
+#            It MAY be the same as a group name -- a name is a directory, a group is a filename stem,
+#            and they are different things.
 #   group -- must be listed in `groups:` above.
 #   round -- an integer. R0 = the initial library. It orders a group's samples, and pairs an `empty`
 #            round to the real rounds with the same transfer/PCR count.

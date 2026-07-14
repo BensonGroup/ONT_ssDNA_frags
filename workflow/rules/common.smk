@@ -48,9 +48,20 @@ BASELINE_GROUP, EMPTY_GROUP = _rl.BASELINE_GROUP, _rl.EMPTY_GROUP
 # minting a new arm. Everything below fails at PARSE time, before any compute, NAMING the offending
 # sample: the code rejects a bad config loudly, it never works around one.
 #
-# A `name` and a `group` share ONE namespace on disk -- `results/umi/<name>/` is a directory and
-# `results/umi/<group>.umi_x_sample.mtx` a file in that same parent -- so both are constrained by the
-# same charset, and neither may collide with the other.
+# A `name` and a `group` are DIFFERENT THINGS and share exactly one constraint: both end up as PATH
+# COMPONENTS, so both must be path-safe. That is all they share.
+#
+#   name  = IDENTITY. A snakemake wildcard, a DIRECTORY, and the filename stem inside it
+#           (`results/umi/<name>/<name>.fused.parquet`).
+#   group = A LABEL. Which arm the sample belongs to, for computing and colouring -- plus the
+#           filename stem of that group's matrix (`results/umi/<group>.umi_x_sample.mtx`).
+#
+# They do NOT share a namespace, and a group MAY be called the same as a sample. `results/umi/A549/`
+# (a directory) and `results/umi/A549.umi_x_sample.mtx` (a file) are different paths and coexist
+# happily; snakemake cannot confuse them either, because one output pattern needs a `/<sample>/` infix
+# and the other a literal `.umi_x_sample.` infix. There WAS a guard here forbidding the coincidence.
+# It was wrong: it rejected a VALID config on grounds of taste, and rejecting a valid config breaks
+# the rule below just as surely as accepting an invalid one does.
 _NAME_CHARSET = r"[A-Za-z0-9][A-Za-z0-9._+-]*"
 
 # (0) the sample NAME: present, globally unique, path-safe. This runs against config["samples"] (the
@@ -154,10 +165,12 @@ if BASELINE_GROUP not in DECLARED_GROUPS:
     )
 
 # (4) a group name becomes a FILENAME STEM (`results/umi/<group>.umi_x_sample.mtx`) in the very
-#     directory the cross-reports glob for samples, so it carries the same charset as a name (guard
-#     (0)): no '/', no spaces. A '/' would instead create a SUBDIRECTORY there -- sitting in exactly
-#     the namespace `BASE.glob("*/")` scans. It must also not collide with a sample name: a group and
-#     a sample are two stems in one directory.
+#     directory the cross-reports glob for samples, so it must be path-safe: no '/', no spaces. A '/'
+#     would instead create a SUBDIRECTORY there -- sitting in exactly the namespace `BASE.glob("*/")`
+#     scans -- which the reports would then discover as a PHANTOM SAMPLE.
+#
+#     A group name MAY equal a sample name. That is not a collision: one is a directory and the other
+#     a filename stem, and no lookup in this codebase is keyed by both. See the note above _NAME_CHARSET.
 for _g in DECLARED_GROUPS:
     if not isinstance(_g, str) or not re.fullmatch(_NAME_CHARSET, _g):
         raise ValueError(
@@ -165,11 +178,6 @@ for _g in DECLARED_GROUPS:
             f"A group name becomes a filename stem in the directory the cross-reports glob for "
             f"samples; a '/' would create a subdirectory there instead, in exactly the namespace "
             f"`BASE.glob(\"*/\")` scans."
-        )
-    if _g in SAMPLE:
-        raise ValueError(
-            f"config.groups: {_g!r} collides with the sample of the same name -- a group and a sample "
-            f"become filename stems in the SAME directory. Rename one."
         )
 
 # (3) every sample's group must be declared, and (6) `round` is required and an int (`group_samples()`
