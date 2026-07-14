@@ -28,6 +28,9 @@ rule umi_correct:
         frags=lambda wc: f"{_umi_src_stem(wc)}.fragments.parquet",
     output:
         fused=f"{OUTDIR}/{{umibase}}/{{sample}}/{{sample}}.fused.parquet",
+        # decode fragment calls carried through UNCHANGED (filtered to kept reads): correction never
+        # touches the fragment level, and start/stop are needed for the positional fragment vector
+        frags=f"{OUTDIR}/{{umibase}}/{{sample}}/{{sample}}.fragments.parquet",
         species=f"{OUTDIR}/{{umibase}}/{{sample}}/{{sample}}.umi_species.tsv",
         summary=f"{OUTDIR}/{{umibase}}/{{sample}}/{{sample}}.umi_summary.tsv",
     wildcard_constraints:
@@ -81,10 +84,57 @@ rule umi_matrix:
         """
 
 
-# Cross-sample UMI report: abundance (rank-abundance, D50/D90), species overlap (UpSet per group),
-# and validity QC (UMI-group ligand-signature purity vs size, collision null model). Discovers
-# experimental samples by globbing umi/*/; the R0 baseline comes from the sibling umi_initial/ tree
-# via L2F_R0_STEM (as the featurecount cross report does). Decode fragments feed the purity QC.
+# Depth-robust effective complexity: C_eff = 1 / P(two random distinct reads share a molecule), the
+# inverse-Simpson complexity of each sample's corrected-UMI pool, plus the COLLAPSE of that
+# complexity relative to the R0 library. Unlike a distinct-UMI count -- which just grows with
+# sequencing depth -- C_eff is a property of the POOL, so it is comparable across samples whose
+# depth spans ~6x here. See complexity_lib.py for the estimator and clarification.md for the theory.
+#
+# These TSVs are FIRST-CLASS OUTPUTS, not a report internal: `report_umi_cross` renders them and
+# recomputes nothing, so a number in the summary table and the same number in a figure cannot drift
+# apart. Inspectable without opening the HTML.
+#
+# Reads only the per-molecule counts `umi_correct` already wrote (.umi_species.tsv). It does NOT
+# depend on `umi_matrix` -- nothing in the estimator reads the umi_x_sample.* files.
+#
+# The INITIAL library is requested UNCONDITIONALLY, unlike report_umi_cross below: `report.r0_baseline`
+# is a report DISPLAY toggle, whereas the collapse is DEFINED relative to R0.
+rule umi_complexity:
+    input:
+        species=[f"{umi_stem(s)}.umi_species.tsv" for s in [INITIAL] + NONINITIAL],
+        meta=f"{OUTDIR}/{CROSSBASE}/sample_metadata.tsv",
+    output:
+        tsv=f"{OUTDIR}/umi/umi_complexity.tsv",
+        collapse=f"{OUTDIR}/umi/umi_collapse.tsv",
+    log:
+        f"{OUTDIR}/umi/umi_complexity.log",
+    params:
+        # NAME=PATH pairs; the script keys group/round/role off NAME via the metadata TSV
+        species=[f"{s}={os.path.abspath(umi_stem(s))}.umi_species.tsv"
+                 for s in [INITIAL] + NONINITIAL],
+        baseline=INITIAL,
+        script=str(SCRIPTS / "effective_complexity.py"),
+    shell:
+        r"""
+        set -euo pipefail
+        pixi run -e default python "{params.script}" \
+          --species {params.species:q} \
+          --meta "{input.meta}" \
+          --baseline "{params.baseline}" \
+          --out-tsv "{output.tsv}" \
+          --out-collapse "{output.collapse}" 2>&1 | tee "{log}"
+        """
+
+
+# Cross-sample UMI report: effective complexity (C_eff trajectory + collapse), abundance
+# (rank-abundance, D50/D90), species overlap (UpSet per group), and validity QC (UMI-group
+# ligand-signature purity vs size, collision null model). Every figure is coloured by the config
+# `group` (cell line). Discovers experimental samples by globbing umi/*/; the R0 baseline comes from
+# the sibling umi_initial/ tree via L2F_R0_STEM (as the featurecount cross report does). Decode
+# fragments feed the purity QC.
+#
+# The complexity TSVs are declared inputs, not just transitively available: the report RENDERS them,
+# so rebuilding it against a stale table would silently publish stale numbers.
 def umi_report_inputs(wildcards):
     ins = []
     for s in NONINITIAL:
@@ -100,6 +150,8 @@ rule report_umi_cross:
     input:
         umi_report_inputs,
         meta=f"{OUTDIR}/{CROSSBASE}/sample_metadata.tsv",
+        cplx=f"{OUTDIR}/umi/umi_complexity.tsv",
+        collapse=f"{OUTDIR}/umi/umi_collapse.tsv",
     output:
         f"{OUTDIR}/umi/umi_report_cross.html",
     params:
@@ -113,5 +165,6 @@ rule report_umi_cross:
         r"""
         L2F_BASE="{params.base}" L2F_R0_STEM="{params.r0_stem}" L2F_SAMPLES="{input.meta}" \
         L2F_DECODE_BASE="{params.decode_base}" L2F_R0_FRAGS="{params.r0_frags}" \
+        L2F_COMPLEXITY="{input.cplx}" L2F_COLLAPSE="{input.collapse}" \
             pixi run -e default python "{params.script}"
         """

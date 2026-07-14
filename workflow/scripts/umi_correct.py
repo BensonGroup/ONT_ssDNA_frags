@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import umi_filter_lib as uf
 import umi_dedup as ud  # reuse build_per_read / run_starcode / starcode_version / prepare_dst / part / CLASS_ORDER
 from ligand_vocab import anchor_set  # authoritative backbone/anchor names (from the umis parquet)
+from complexity_lib import c_eff, collision_prob     # depth-robust effective complexity (see complexity_lib docstring)
 
 TOOL_VERSION = "umi_correct.py/1.0"
 
@@ -115,7 +116,7 @@ def main(argv: list[str]) -> int:
     # and must not inflate a molecule's read count.
     anchors = anchor_set(umis_pq)
     anc_ids = sorted(set(anchors) | {f"{a}_rc" for a in anchors})
-    frags = pl.read_parquet(frags_pq, columns=["read_acc", "fragment_id"])
+    frags = pl.read_parquet(frags_pq)   # ALL columns: fragment_id, start, stop, edit_distance, ...
     payload_reads = frags.filter(~pl.col("fragment_id").is_in(anc_ids)).select("read_acc").unique()
     kept = umi_ok.join(payload_reads, on="read_acc", how="semi")
     reads_kept = kept.height
@@ -178,6 +179,23 @@ def main(argv: list[str]) -> int:
 
     species.write_csv(dst_dir / f"{stem}.umi_species.tsv", separator="\t", include_header=True)
 
+    # Carry the decode FRAGMENT CALLS through, filtered to the kept reads and otherwise untouched.
+    # UMI correction filters reads and rewrites the UMI sequence; it changes NOTHING at the fragment
+    # level -- fragment_id / start / stop / edit_distance are exactly as the decoder emitted them. Keeping
+    # them here makes the umi/ tree self-contained: corrected UMI + the decoded architecture (including
+    # the start/stop positions needed to rebuild the POSITIONAL fragment vector) in one place.
+    (frags.join(out.select("read_acc"), on="read_acc", how="semi")
+     .sort([c for c in ("read_acc", "start", "stop", "fragment_id") if c in frags.columns])
+     .write_parquet(dst_dir / f"{stem}.fragments.parquet"))
+
+    # Depth-robust MOLECULAR complexity. n_species_* are richness counts and grow with sequencing
+    # depth, so they must NOT be compared across samples raw; c_eff estimates a property of the pool
+    # (its read-collision probability) and is depth-robust. A sample with no duplicates at all (an
+    # un-bottlenecked control) yields a LOWER BOUND -- see c_eff_is_lower_bound.
+    _counts = species["n_reads"].to_list()
+    _N, _D, _pairs, _C, _lower = c_eff(_counts)
+    _pc = collision_prob(_counts)
+
     row = {
         "sample": stem,
         "reads_in": reads_in,
@@ -192,6 +210,12 @@ def main(argv: list[str]) -> int:
         "n_species_corrected": n_species_corrected,
         "n_species_merged": n_species_merged,
         "n_reads_relabeled": n_reads_relabeled,
+        # --- depth-robust complexity (compare THESE across samples, not n_species_*) ---
+        "dup_pairs": _pairs,
+        "collision_prob": _pc,   # sum p_i^2 — the UNBIASED depth-robust quantity (c_eff is its reciprocal)
+        "c_eff": round(_C, 1) if _C != float("inf") else None,
+        "c_eff_is_lower_bound": _lower,
+        "n_over_c_eff": round(_N / _C, 4) if _C not in (0, float("inf")) else None,
     }
     pl.DataFrame([row]).write_csv(dst_dir / f"{stem}.umi_summary.tsv", separator="\t")
 

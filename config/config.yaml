@@ -78,7 +78,12 @@ report:
   r0_baseline: true  # wire the initial library as the shared R0 baseline in the cross report
 
 # ---- samples ------------------------------------------------------------------------
-# role: experimental | initial  (exactly one `initial`, used as the R0 baseline).
+# role: experimental | initial | control   (exactly one `initial`, used as the R0 baseline).
+#   control = an EMPTY / PCR-only round: the same transfers and PCR cycles as a selection round, but no
+#   biological material. It is the null for everything that depends on the pool being bottlenecked, and
+#   is the ONLY way to separate the complexity collapse caused by SELECTION from the collapse caused by
+#   the protocol itself (each aliquot transfer is a bottleneck). Controls run through every stage and
+#   appear in every report, but never form a group matrix.
 # group = cell line, round = selection round. Names must be globally unique.
 samples:
   - {name: A549_R1, group: A549, round: 1, role: experimental, fastq: /home/hongj/projects/cell/rawdata/ONT/A549/A549_R1.fastq}

@@ -14,7 +14,18 @@ SCRIPTS = Path(workflow.basedir) / "scripts"
 # ---- sample table ------------------------------------------------------------------
 SAMPLE = {s["name"]: s for s in config["samples"]}
 SAMPLES = list(SAMPLE.keys())
+_ROLES = {"experimental", "initial", "control"}
+for _n, _s in SAMPLE.items():
+    if _s.get("role") not in _ROLES:
+        raise ValueError(f"config.samples[{_n!r}].role: {_s.get('role')!r} is not one of {sorted(_ROLES)}")
 EXPERIMENTAL = [n for n, s in SAMPLE.items() if s["role"] == "experimental"]
+# `control` = an EMPTY / PCR-only round: the same transfers and PCR cycles as a selection round, but no
+# biological selection. It is the null for everything that depends on the pool being bottlenecked --
+# duplication, effective complexity, and the enrichment fold-change. `rule umi_complexity` uses it to
+# split a collapse into its PROTOCOL and SELECTION parts. Controls flow through every stage and appear
+# in every report, but they are NOT a selection arm, so they never form a group matrix (see GROUPS_EXP /
+# group_samples below, which are built from EXPERIMENTAL only).
+CONTROLS = [n for n, s in SAMPLE.items() if s["role"] == "control"]
 # Everything except the R0 `initial` decodes into the shared `decode/` tree; this is exactly
 # what the cross-sample report globs and groups (by config `group`). `role` beyond `initial`
 # does not change processing — all non-initial samples are handled identically.
@@ -185,14 +196,16 @@ def umi_stem(s):
     return f"{OUTDIR}/{umibase(s)}/{s}/{s}"
 
 
-# Experimental groups (config `group`, in config order). Each group gets ONE UMI x sample matrix
-# whose column order is the initial library (R0 baseline) first, then that group's samples by round.
-GROUPS_EXP = list(dict.fromkeys(SAMPLE[s]["group"] for s in NONINITIAL))
+# Experimental groups (config `group`, in config order). Each group gets ONE matrix whose column order
+# is the initial library (R0 baseline) first, then that group's rounds ascending.
+# Built from EXPERIMENTAL, NOT NONINITIAL: a `control` (empty/PCR-only) round is not a selection arm and
+# must never be swept into a group's matrix. Controls still flow through every stage and every report.
+GROUPS_EXP = list(dict.fromkeys(SAMPLE[s]["group"] for s in EXPERIMENTAL))
 
 
 def group_samples(g):
     """Ordered samples for group g's matrix: the R0 initial library first, then g's rounds ascending."""
-    members = sorted((s for s in NONINITIAL if SAMPLE[s]["group"] == g),
+    members = sorted((s for s in EXPERIMENTAL if SAMPLE[s]["group"] == g),
                      key=lambda s: (SAMPLE[s]["round"], s))
     return [INITIAL] + members
 

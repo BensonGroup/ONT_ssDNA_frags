@@ -21,21 +21,31 @@ rule report_sample:
         """
 
 
-# Per-sample grouping metadata (from the config `samples` table) that the cross-report script
-# reads to order and label columns by `group`/`round` instead of parsing the sample name.
-# One row per non-initial sample; `idx` is config order so groups appear as configured.
+# Per-sample grouping metadata (from the config `samples` table) that the cross-report scripts read
+# to order, colour and label columns by `group`/`round` instead of parsing the sample name.
+#
+# EVERY sample, including the R0 `initial` library. The reports only ever look up names they globbed
+# out of the non-initial tree, so the extra row is inert for them -- but it means the baseline's
+# group/round/role come from the config like everyone else's, instead of each report hardcoding its
+# own name for it (they disagreed: two said "initial", one said "library"). It also lets
+# `rule umi_complexity` read the whole sample table from one file.
+#
+# Schema: name<TAB>group<TAB>round<TAB>idx<TAB>role   -- `idx` is config order, so groups appear as
+# configured. APPEND-ONLY: see the warning in report_lib.load_meta() -- inserting a column before
+# `idx` silently degrades the sort key and makes the cell lines interleave by round.
 rule cross_sample_metadata:
     output:
         f"{OUTDIR}/{{crossbase}}/sample_metadata.tsv",
     params:
-        rows=[(n, str(SAMPLE[n].get("group", "") or ""), SAMPLE[n].get("round"), i)
-              for i, n in enumerate(SAMPLES) if SAMPLE[n]["role"] != "initial"],
+        rows=[(n, str(SAMPLE[n].get("group", "") or ""), SAMPLE[n].get("round"), i,
+               SAMPLE[n]["role"])
+              for i, n in enumerate(SAMPLES)],
     run:
         with open(output[0], "w") as out:
-            out.write("name\tgroup\tround\tidx\n")
-            for name, group, rnd, idx in params.rows:
+            out.write("name\tgroup\tround\tidx\trole\n")
+            for name, group, rnd, idx, role in params.rows:
                 r = "" if rnd is None else rnd
-                out.write(f"{name}\t{group}\t{r}\t{idx}\n")
+                out.write(f"{name}\t{group}\t{r}\t{idx}\t{role}\n")
 
 
 def cross_inputs(wildcards):

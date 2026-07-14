@@ -2,27 +2,44 @@
 """Cross-sample UMI characterisation report (branch `umi`, mode `correct`).
 
 Descriptive workflow QC over the per-sample corrected-UMI outputs (`umi/<s>/<s>.umi_species.tsv`,
-`.umi_summary.tsv`, `.fused.parquet`). One self-contained HTML file, plotly figures inlined.
+`.umi_summary.tsv`, `.fused.parquet`) and the complexity tables (`umi_complexity.tsv`,
+`umi_collapse.tsv`). One self-contained HTML file, plotly figures inlined.
 
-Panels (no biological interpretation — this is a workflow):
-  * Summary        per-sample reads in / filtered (by class) / corrected (species merged, reads relabelled).
+EVERY FIGURE IS ORGANISED BY `group` -- the config's cell line. One colour per group (report_lib's
+CVD-validated palette, the same colour in all three cross reports), the R0 initial library always
+grey and dashed because it is a shared baseline, not a selection arm.
+
+Panels (no biological interpretation -- this is a workflow):
+  * Summary        per-sample reads in / filtered (by class) / corrected (species merged, relabelled).
+  * Complexity     C_eff vs selection round per group, the collapse relative to R0, and the
+                   depth-corrected richness. THE depth-robust view; read it before anything below.
   * Abundance      rank-abundance curves (log-log) and D50/D90 = the proportion of distinct UMI
                    species whose cumulative reads reach 50% / 90% (+ a Lorenz-style curve).
-  * Overlap        per experimental group, an UpSet-like view of distinct corrected-UMI species shared
-                   across the group's samples (top-N intersections).
+  * Overlap        per experimental group, an UpSet-like view of distinct corrected-UMI species
+                   shared across the group's samples (top-N intersections).
   * Validity QC    UMI-group ligand-signature purity vs group size (join corrected UMI -> decode
-                   fragments), and a collision null model (expected chance ed<=1 merges vs observed).
+                   fragments), per group, and a collision null model (expected chance ed<=1 merges
+                   vs observed).
+
+THIS SCRIPT COMPUTES NO COMPLEXITY. It renders `umi_complexity.tsv` / `umi_collapse.tsv`, which
+`rule umi_complexity` produced via effective_complexity.py -> complexity_lib. That is deliberate:
+the estimator has exactly two callers in this branch (umi_correct.py and effective_complexity.py),
+so the number in a table and the number in a figure cannot drift apart. It used to recompute c_eff
+and the rarefaction depth here, over the DISCOVERED sample set rather than the DECLARED one -- which
+silently disagreed with the table whenever report.r0_baseline was off.
 
 Parameterised entirely by environment variables (set by rule report_umi_cross):
     L2F_BASE          umi/ dir to glob `*/` for experimental sample subdirs
     L2F_R0_STEM       umi_initial/.../<INITIAL> stem for the R0 baseline ("" disables it)
-    L2F_SAMPLES       config-derived metadata TSV (name<TAB>group<TAB>round<TAB>idx)
+    L2F_SAMPLES       config-derived metadata TSV (name<TAB>group<TAB>round<TAB>idx<TAB>role)
+    L2F_COMPLEXITY    per-sample complexity table (umi_complexity.tsv)
+    L2F_COLLAPSE      per-sample collapse ratios (umi_collapse.tsv)
     L2F_DECODE_BASE   decode/ dir (experimental fragments for the purity QC)
     L2F_R0_FRAGS      the initial library's decode fragments.parquet ("" if no baseline)
 """
 from __future__ import annotations
 
-import html
+import csv
 import math
 import os
 import sys
@@ -33,57 +50,39 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from plotly.offline import get_plotlyjs
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from report_lib import (
+    BASELINE_GREY, GREY, color_key_html, esc, fig_html, first_of_group, group_band, group_color,
+    group_dividers, load_meta,
+)
+
 BASE = Path(os.environ.get("L2F_BASE", "")).resolve()
 R0_STEM = os.environ.get("L2F_R0_STEM", "").strip()
 SAMPLES_TSV = os.environ.get("L2F_SAMPLES", "").strip()
+COMPLEXITY_TSV = os.environ.get("L2F_COMPLEXITY", "").strip()
+COLLAPSE_TSV = os.environ.get("L2F_COLLAPSE", "").strip()
 DECODE_BASE = os.environ.get("L2F_DECODE_BASE", "").strip()
 R0_FRAGS = os.environ.get("L2F_R0_FRAGS", "").strip()
 OUT = BASE / "umi_report_cross.html"
 
-PALETTE = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2",
-           "#EECA3B", "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC"]
-GREY = "#9aa0a6"
 
-
-def esc(s) -> str:
-    return html.escape(str(s))
-
-
-def fig_html(fig) -> str:
-    return fig.to_html(full_html=False, include_plotlyjs=False,
-                       default_width="100%", config={"displaylogo": False, "responsive": True})
-
-
-def style(fig, height, title=None):
+def style(fig, height, title=None, top=None):
+    # `top` reserves extra top margin for a rotated group band (see report_lib.group_band): a
+    # rotated label is ~0.7*(width + height) tall and would otherwise collide with the title.
     fig.update_layout(
         height=height, title=title, template="plotly_white",
-        margin=dict(l=60, r=20, t=50 if title else 20, b=50),
+        margin=dict(l=60, r=20, t=(top if top else (50 if title else 20)), b=50),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         font=dict(size=12),
     )
     return fig
 
 
+def sci(v):
+    return "" if v is None else f"{v:.3g}"
+
+
 # --------------------------------------------------------------------------- discovery + metadata
-def load_meta():
-    meta = {}
-    if SAMPLES_TSV and Path(SAMPLES_TSV).exists():
-        for i, line in enumerate(Path(SAMPLES_TSV).read_text().splitlines()):
-            if i == 0 or not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 3:
-                meta[parts[0]] = {"group": parts[1], "round": _int(parts[2]), "idx": _int(parts[3]) if len(parts) > 3 else i}
-    return meta
-
-
-def _int(x, default=0):
-    try:
-        return int(x)
-    except (TypeError, ValueError):
-        return default
-
-
 def discover(meta):
     samples = []
     for d in sorted(p for p in BASE.glob("*/") if p.is_dir()):
@@ -100,18 +99,23 @@ def discover(meta):
             "group": m.get("group", _parse_group(name)),
             "round": m.get("round", _parse_round(name)),
             "idx": m.get("idx", 10_000),
+            "role": m.get("role", "experimental"),
             "is_baseline": False,
         })
     samples.sort(key=lambda s: (s["idx"], s["round"], s["name"]))
     if R0_STEM:
         r0 = Path(R0_STEM)
         if (r0.parent / f"{r0.name}.umi_species.tsv").exists():
+            m = meta.get(r0.name, {})
             samples.insert(0, {
                 "name": r0.name, "dir": r0.parent, "species": r0.parent / f"{r0.name}.umi_species.tsv",
                 "summary": r0.parent / f"{r0.name}.umi_summary.tsv",
                 "fused": r0.parent / f"{r0.name}.fused.parquet",
                 "frags": Path(R0_FRAGS) if R0_FRAGS else None,
-                "group": "initial", "round": 0, "idx": -1, "is_baseline": True,
+                # the baseline's group/round now come from the config like everyone else's; the
+                # literals are only the fallback for a standalone run with no metadata TSV
+                "group": m.get("group", "initial"), "round": m.get("round", 0),
+                "idx": -1, "role": "initial", "is_baseline": True,
             })
     return samples
 
@@ -141,27 +145,248 @@ def load_summary(s):
     return df.row(0, named=True) if df.height else {}
 
 
-def group_color(samples):
-    groups = list(dict.fromkeys(s["group"] for s in samples))
-    return {g: PALETTE[i % len(PALETTE)] for i, g in enumerate(groups)}
+def load_table(path):
+    """A TSV emitted by effective_complexity.py -> list of dicts, numbers coerced, blanks -> None."""
+    if not path or not Path(path).exists():
+        return []
+    rows = []
+    with open(path) as fh:
+        for r in csv.DictReader(fh, delimiter="\t"):
+            rows.append({k: _num(v) for k, v in r.items()})
+    return rows
+
+
+def _num(v):
+    if v is None or v == "":
+        return None
+    if v in ("true", "false"):
+        return v == "true"
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        return v
+
+
+def fmt(v, nd=0):
+    """Table cell: thousands-separated, and never `None`/`inf`/`nan` (an empty cell is honest)."""
+    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+        return ""
+    if isinstance(v, bool):
+        return "yes" if v else ""
+    if isinstance(v, float):
+        return f"{v:,.{nd}f}" if abs(v) >= 0.001 or v == 0 else f"{v:.3g}"
+    return f"{v:,}"
+
+
+def c_eff_cell(row):
+    """C_eff, prefixed `>` when it is only a 95% lower bound (no collisions observed).
+
+    Never render a bound as a point estimate: an un-bottlenecked pool has NO duplicate reads, so
+    1/S is unbounded and N(N-1)/6 is all that can honestly be said. See complexity_lib.c_eff().
+    """
+    if row.get("c_eff") is None:
+        return ""
+    mark = "&gt; " if row.get("c_eff_is_lower_bound") else ""
+    return f"{mark}{row['c_eff']:,.0f}"
 
 
 # --------------------------------------------------------------------------- panels
-def summary_table(samples, summaries):
+def summary_table(samples, summaries, cplx, gcol):
+    # DEPTH-DEPENDENT columns are flagged: they grow with sequencing depth, so they describe the RUN,
+    # not the LIBRARY, and must not be compared across samples of unequal depth. Same idiom as the
+    # fragvec cross report. c_eff / collision_prob are the depth-ROBUST alternatives.
+    depth_dep = {"n_species_raw", "n_species_corrected", "n_species_merged"}
     cols = ["reads_in", "dropped_nonacgt", "dropped_lowcomplexity", "dropped_umilen",
             "dropped_total", "reads_umi_ok", "dropped_no_payload", "reads_kept",
-            "n_species_raw", "n_species_corrected", "n_species_merged", "n_reads_relabeled"]
-    head = "".join(f"<th>{esc(c)}</th>" for c in cols)
+            "n_species_raw", "n_species_corrected", "n_species_merged", "n_reads_relabeled",
+            "dup_pairs", "collision_prob", "c_eff", "n_over_c_eff"]
+    head = "".join(
+        f"<th title='DEPTH-DEPENDENT — do not compare across samples'>{esc(c)} ⚠</th>"
+        if c in depth_dep else f"<th>{esc(c)}</th>" for c in cols)
+    by_name = {r["name"]: r for r in cplx}
     rows = []
     for s in samples:
-        d = summaries.get(s["name"], {})
-        cells = "".join(f"<td class='num'>{d.get(c, ''):,}</td>" if isinstance(d.get(c), int)
-                        else f"<td class='num'>{esc(d.get(c, ''))}</td>" for c in cols)
-        rows.append(f"<tr><td>{esc(s['name'])}</td><td>{esc(s['group'])}</td>"
-                    f"<td class='num'>{s['round']}</td>{cells}</tr>")
+        d = dict(summaries.get(s["name"], {}))
+        d.update({k: v for k, v in by_name.get(s["name"], {}).items() if v is not None})
+        cells = []
+        for c in cols:
+            if c == "c_eff":
+                cells.append(f"<td class='num'>{c_eff_cell(by_name.get(s['name'], {}))}</td>")
+            elif c == "collision_prob":
+                cells.append(f"<td class='num'>{sci(d.get(c))}</td>")
+            elif c == "n_over_c_eff":
+                cells.append(f"<td class='num'>{fmt(d.get(c), 3)}</td>")
+            else:
+                cells.append(f"<td class='num'>{fmt(d.get(c))}</td>")
+        swatch = (f"<span style='display:inline-block;width:.7rem;height:.7rem;border-radius:2px;"
+                  f"margin-right:.4rem;background:{gcol.get(s['group'], GREY)}'></span>")
+        rows.append(f"<tr><td>{esc(s['name'])}</td><td>{swatch}{esc(s['group'])}</td>"
+                    f"<td class='num'>{s['round']}</td>{''.join(cells)}</tr>")
     return (f"<h2>Filter &amp; correction summary</h2><div style='overflow-x:auto'><table>"
             f"<thead><tr><th>sample</th><th>group</th><th>round</th>{head}</tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>")
+
+
+def fig_ceff_trajectory(samples, cplx, collapse, gcol):
+    """C_eff vs selection round, one line per group, all starting from the shared R0 library.
+
+    The headline figure of the UMI branch. Log y because the collapse spans orders of magnitude.
+
+    Error bars are C_eff/sqrt(dup_pairs) -- the delta-method standard error of a reciprocal, with S
+    treated as quasi-Poisson in its collision count. They are not decoration: two samples can carry
+    near-identical C_eff point estimates while one rests on 237 collisions and the other on 3,076,
+    a ~3.6x difference in relative precision. A bare point estimate hides exactly that.
+    """
+    by_name = {r["name"]: r for r in cplx}
+    base = next((s for s in samples if s["is_baseline"]), None)
+    brow = by_name.get(base["name"]) if base else None
+    total = {r["sample"]: r for r in collapse if r.get("kind") == "total"}
+
+    groups = [g for g in dict.fromkeys(s["group"] for s in samples if not s["is_baseline"])]
+    fig = go.Figure()
+    for g in groups:
+        members = sorted((s for s in samples if s["group"] == g and not s["is_baseline"]),
+                         key=lambda s: s["round"])
+        pts = ([(brow["round"] if brow.get("round") is not None else 0, brow)] if brow else [])
+        pts += [(s["round"], by_name[s["name"]]) for s in members if s["name"] in by_name]
+        pts = [(r, row) for r, row in pts if row and row.get("c_eff") is not None]
+        if not pts:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1]["c_eff"] for p in pts]
+        # a lower bound is drawn hollow: it is not a measurement of where the point IS
+        lb = [bool(p[1].get("c_eff_is_lower_bound")) for p in pts]
+        err = [(p[1]["c_eff"] / math.sqrt(p[1]["dup_pairs"])) if p[1].get("dup_pairs") else 0
+               for p in pts]
+        names = [p[1]["name"] for p in pts]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines+markers", name=esc(g), legendgroup=g,
+            line=dict(color=gcol.get(g, GREY), width=2.2),
+            marker=dict(size=10, color=gcol.get(g, GREY),
+                        symbol=["circle-open" if b else "circle" for b in lb],
+                        line=dict(width=2, color=gcol.get(g, GREY))),
+            error_y=dict(type="data", array=err, visible=True, thickness=1.2, width=4,
+                         color=gcol.get(g, GREY)),
+            customdata=list(zip(names, [p[1].get("dup_pairs") or 0 for p in pts], lb)),
+            hovertemplate=("%{customdata[0]}<br>C_eff %{y:,.0f}<br>"
+                           "%{customdata[1]:,} duplicate pairs<extra>" + esc(g) + "</extra>"),
+        ))
+        # the fold-drop, stated at the end of each arm (and only where it is a point estimate)
+        last = members[-1]["name"] if members else None
+        row = total.get(last)
+        if row and row.get("ratio") and not row.get("ratio_bound"):
+            fig.add_annotation(x=xs[-1], y=math.log10(ys[-1]), xref="x", yref="y",
+                               text=f"<b>{esc(g)}</b>  {row['ratio']:,.0f}× drop",
+                               xanchor="left", xshift=12, showarrow=False,
+                               font=dict(size=11, color=gcol.get(g, GREY)))
+    if brow and brow.get("c_eff"):
+        fig.add_annotation(x=brow.get("round") or 0, y=math.log10(brow["c_eff"]),
+                           text=f"initial library {brow['c_eff'] / 1e6:,.0f}M",
+                           yshift=16, showarrow=False, font=dict(size=10, color=GREY))
+    rounds = sorted({s["round"] for s in samples})
+    fig.update_xaxes(title="selection round", tickmode="array", tickvals=rounds,
+                     ticktext=[("R0<br>(initial)" if r == 0 else f"R{r}") for r in rounds],
+                     range=[min(rounds) - 0.3, max(rounds) + 1.1])
+    fig.update_yaxes(type="log", title="C_eff (effective lineage complexity)")
+    note = ("<p class='small'>Hollow markers are <b>lower bounds</b> (no duplicate reads observed — "
+            "the reciprocal is unbounded and only <code>N(N−1)/6</code> can be claimed). Error bars "
+            "are <code>C_eff/√dup_pairs</code>: an estimate resting on 237 collisions is far softer "
+            "than one resting on 20,754, and the point estimates alone do not show that.</p>")
+    return note + fig_html(style(fig, 520, "Effective complexity by selection round"))
+
+
+def ceff_table(samples, cplx, collapse, gcol):
+    """C_eff with the three companions clarification.md §8.5 requires it never be read without."""
+    by_name = {r["name"]: r for r in cplx}
+    total = {r["sample"]: r for r in collapse if r.get("kind") == "total"}
+    order = [s for s in samples if s["name"] in by_name]
+    rows = []
+    for s in order:
+        r = by_name[s["name"]]
+        col = total.get(s["name"], {})
+        ratio = ("" if not col.get("ratio")
+                 else f"{esc(col.get('ratio_bound') or '')}{col['ratio']:,.1f}×")
+        top = ("" if r.get("top10_share_of_S") is None
+               else f"{100 * r['top10_share_of_S']:.1f}%")
+        swatch = (f"<span style='display:inline-block;width:.7rem;height:.7rem;border-radius:2px;"
+                  f"margin-right:.4rem;background:{gcol.get(s['group'], GREY)}'></span>")
+        rows.append(
+            f"<tr><td>{swatch}{esc(s['name'])}</td>"
+            f"<td class='num'>{fmt(r.get('n_reads'))}</td>"
+            f"<td class='num'>{fmt(r.get('n_distinct'))}</td>"
+            f"<td class='num'>{fmt(r.get('n_distinct_rarefied'), 0)}</td>"
+            f"<td class='num'>{fmt(r.get('dup_pairs'))}</td>"
+            f"<td class='num'>{sci(r.get('collision_prob'))}</td>"
+            f"<td class='num'><b>{c_eff_cell(r)}</b></td>"
+            f"<td class='num'>{fmt(r.get('n_over_c_eff'), 3)}</td>"
+            f"<td class='num'>{fmt(r.get('max_n_i'))}</td>"
+            f"<td class='num'>{top}</td>"
+            f"<td class='num'>{ratio}</td></tr>")
+    m = next((r.get("rarefied_to") for r in cplx if r.get("rarefied_to")), None)
+    head = (
+        "<tr>"
+        "<th>sample</th>"
+        "<th title='total payload reads'>N reads</th>"
+        "<th title='DEPTH-DEPENDENT — do not compare across samples'>distinct ⚠</th>"
+        f"<th title='distinct UMIs rarefied to a common depth of {fmt(m)} reads'>rarefied</th>"
+        "<th title='observed duplicate read-pairs — how much evidence C_eff rests on'>dup pairs</th>"
+        "<th title='S = Σpᵢ² — the primitive, unbiased at any depth'>S</th>"
+        "<th title='1/S — depth-robust; a LOWER BOUND on richness, never a headcount'>C_eff</th>"
+        "<th title='&lt;&lt;1 = you sampled a small fraction of the pool'>N/C_eff</th>"
+        "<th title='reads on the single most abundant lineage'>max nᵢ</th>"
+        "<th title='share of all collisions carried by the top 10 lineages'>top10 %S</th>"
+        "<th title='C_eff(R0) / C_eff(sample)'>collapse vs R0</th>"
+        "</tr>")
+    return (f"<div style='overflow-x:auto'><table><thead>{head}</thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>")
+
+
+def fig_depth_complexity(samples, cplx, gcol):
+    """Richness at a COMMON depth, beside the raw count it corrects.
+
+    Renders umi_complexity.tsv; computes nothing. Colour carries the GROUP; the raw-vs-rarefied
+    contrast is carried by a hatch pattern, so hue is never doing two jobs at once.
+    """
+    by_name = {r["name"]: r for r in cplx}
+    order = [s for s in samples if s["name"] in by_name]
+    if not order:
+        return "<p class='small'>No complexity table.</p>"
+    names = [s["name"] for s in order]
+    rar = [by_name[n].get("n_distinct_rarefied") for n in names]
+    raw = [by_name[n].get("n_distinct") for n in names]
+    colors = [gcol.get(s["group"], GREY) for s in order]
+    m = next((r.get("rarefied_to") for r in cplx if r.get("rarefied_to")), None)
+    depths = [by_name[n].get("n_reads") or 0 for n in names]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=names, y=rar, name=f"distinct UMIs, RAREFIED to {fmt(m)} reads",
+                         marker=dict(color=colors)))
+    fig.add_trace(go.Bar(x=names, y=raw, name="raw distinct UMIs (DEPTH-DEPENDENT)",
+                         marker=dict(color=colors, opacity=0.35,
+                                     pattern=dict(shape="/", solidity=0.35))))
+    for x in group_dividers(order):
+        fig.add_vline(x=x, line_color=GREY, line_width=1, opacity=0.5)
+    group_band(fig, order, yshift=6)
+    fig.update_layout(barmode="group", yaxis=dict(title="distinct corrected UMIs"))
+    lo, hi = min(depths), max(depths)
+    note = (
+        f"<p class='small'><b>Read depth spans {lo:,}–{hi:,} ({hi / lo:.1f}×) across these samples.</b> "
+        f"A raw species count grows with depth, so the hatched bars are not comparable — compare the "
+        f"solid ones (rarefied to a common {fmt(m)} reads). <em>If a number gets bigger when you "
+        f"sequence more, it is not a property of your library.</em> Every panel below this section is "
+        f"a species count and inherits this caveat.</p>"
+        f"<p class='small'>⚠ <b>But read the rarefied bars with care too: at this depth they are "
+        f"measuring the instrument, not the pool.</b> Rarefaction saturates when the pool is far "
+        f"larger than the depth — nearly every read lands on an unseen lineage, so E[distinct] → m "
+        f"for <em>any</em> sufficiently large pool. That is why R0 and the deep-collapsed rounds "
+        f"look almost equally rich here while their <code>C_eff</code> differs by orders of "
+        f"magnitude. Where the two disagree, <code>C_eff</code> is the one still saying something "
+        f"about the library.</p>")
+    return note + fig_html(style(fig, 480, "Richness at a common depth (depth-corrected)", top=88))
 
 
 def _plot_idx(n, cap=2000):
@@ -173,18 +398,27 @@ def _plot_idx(n, cap=2000):
     return sorted({0, n - 1} | {min(n - 1, int(math.exp(step * i)) - 1) for i in range(cap)})
 
 
+def _round_dash(s):
+    """Rounds WITHIN a group are told apart by dash, not by hue or by a legend entry — the legend
+    names groups (3 entries), not samples (11)."""
+    if s["is_baseline"]:
+        return "dot"
+    return ["solid", "dash", "longdash", "dashdot", "longdashdot"][(s["round"] - 1) % 5]
+
+
 def fig_rank_abundance(samples, species, gcol):
     fig = go.Figure()
-    for s in samples:
+    show = first_of_group(samples)
+    for s, first in zip(samples, show):
         df = species[s["name"]].sort("n_reads", descending=True)
         y = df["n_reads"].to_list()
         if not y:
             continue
         idx = _plot_idx(len(y))
         fig.add_trace(go.Scatter(
-            x=[i + 1 for i in idx], y=[y[i] for i in idx], mode="lines", name=esc(s["name"]),
-            line=dict(color=gcol.get(s["group"], GREY), width=1.6,
-                      dash="dot" if s["is_baseline"] else "solid"),
+            x=[i + 1 for i in idx], y=[y[i] for i in idx], mode="lines", name=esc(s["group"]),
+            legendgroup=s["group"], showlegend=first,
+            line=dict(color=gcol.get(s["group"], GREY), width=1.6, dash=_round_dash(s)),
             hovertemplate="rank %{x}<br>%{y} reads<extra>" + esc(s["name"]) + "</extra>",
         ))
     fig.update_xaxes(type="log", title="UMI species rank")
@@ -205,13 +439,14 @@ def _d_proportion(counts_desc, frac):
 
 
 def fig_complexity(samples, species, gcol):
-    names, d50, d90 = [], [], []
+    order, d50, d90 = [], [], []
     lorenz = go.Figure()
-    for s in samples:
+    show = first_of_group(samples)
+    for s, first in zip(samples, show):
         cd = species[s["name"]].sort("n_reads", descending=True)["n_reads"].to_list()
         if not cd:
             continue
-        names.append(s["name"])
+        order.append(s)
         d50.append(100 * _d_proportion(cd, 0.5))
         d90.append(100 * _d_proportion(cd, 0.9))
         n = len(cd)
@@ -222,27 +457,35 @@ def fig_complexity(samples, species, gcol):
             xs_full.append(i / n)
             ys_full.append(cum / total)
         idx = [0] + [i + 1 for i in _plot_idx(n)]  # keep the (0,0) origin + thinned curve
-        xs = [xs_full[i] for i in idx]
-        ys = [ys_full[i] for i in idx]
         lorenz.add_trace(go.Scatter(
-            x=xs, y=ys, mode="lines", name=esc(s["name"]),
-            line=dict(color=gcol.get(s["group"], GREY), width=1.4,
-                      dash="dot" if s["is_baseline"] else "solid"),
+            x=[xs_full[i] for i in idx], y=[ys_full[i] for i in idx], mode="lines",
+            name=esc(s["group"]), legendgroup=s["group"], showlegend=first,
+            line=dict(color=gcol.get(s["group"], GREY), width=1.4, dash=_round_dash(s)),
+            hovertemplate="%{x:.1%} of species<br>%{y:.1%} of reads<extra>"
+                          + esc(s["name"]) + "</extra>",
         ))
     lorenz.add_shape(type="line", x0=0, y0=0.5, x1=1, y1=0.5, line=dict(color=GREY, dash="dash", width=1))
     lorenz.add_shape(type="line", x0=0, y0=0.9, x1=1, y1=0.9, line=dict(color=GREY, dash="dash", width=1))
     lorenz.update_xaxes(title="cumulative fraction of species (ranked by abundance)")
     lorenz.update_yaxes(title="cumulative fraction of reads")
+
+    names = [s["name"] for s in order]
+    colors = [gcol.get(s["group"], GREY) for s in order]
     bars = go.Figure()
-    bars.add_trace(go.Bar(x=names, y=d50, name="D50", marker_color="#4C78A8"))
-    bars.add_trace(go.Bar(x=names, y=d90, name="D90", marker_color="#F58518"))
+    bars.add_trace(go.Bar(x=names, y=d50, name="D50", marker=dict(color=colors)))
+    bars.add_trace(go.Bar(x=names, y=d90, name="D90",
+                          marker=dict(color=colors, opacity=0.4,
+                                      pattern=dict(shape="/", solidity=0.35))))
+    for x in group_dividers(order):
+        bars.add_vline(x=x, line_color=GREY, line_width=1, opacity=0.5)
+    group_band(bars, order, yshift=6)
     bars.update_yaxes(title="% of distinct species reaching 50% / 90% of reads")
     bars.update_layout(barmode="group")
-    return (fig_html(style(bars, 420, "Complexity: D50 / D90 (lower = more concentrated)"))
+    return (fig_html(style(bars, 440, "Complexity: D50 / D90 (lower = more concentrated)", top=88))
             + fig_html(style(lorenz, 460, "Cumulative abundance (Lorenz)")))
 
 
-def fig_upset(group, gsamples, species, top_n=24):
+def fig_upset(group, gsamples, species, color, top_n=24):
     long = pl.concat([
         species[nm].select(pl.col("umi").alias("fused_umi")).with_columns(pl.lit(nm).alias("sample"))
         for nm in gsamples if species[nm].height
@@ -252,14 +495,13 @@ def fig_upset(group, gsamples, species, top_n=24):
     bitmap = pl.DataFrame({"sample": gsamples, "bitval": [1 << i for i in range(len(gsamples))]})
     patt = long.join(bitmap, on="sample").group_by("fused_umi").agg(pl.col("bitval").sum().alias("mask"))
     counts = patt.group_by("mask").agg(pl.len().alias("size")).sort("size", descending=True)
-    rows = counts.head(top_n).iter_rows()  # (mask, size)
     masks = []
-    for mask, size in rows:
+    for mask, size in counts.head(top_n).iter_rows():
         members = [j for j in range(len(gsamples)) if mask & (1 << j)]
         masks.append((members, size))
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.62, 0.38], vertical_spacing=0.04)
     xs = list(range(len(masks)))
-    fig.add_trace(go.Bar(x=xs, y=[m[1] for m in masks], marker_color="#4C78A8",
+    fig.add_trace(go.Bar(x=xs, y=[m[1] for m in masks], marker_color=color,
                          hovertemplate="%{y} species<extra></extra>"), row=1, col=1)
     for xi, (members, _sz) in enumerate(masks):
         # faint dots for all rows, solid for members, connected
@@ -268,13 +510,17 @@ def fig_upset(group, gsamples, species, top_n=24):
                                  hoverinfo="skip"), row=2, col=1)
         if members:
             fig.add_trace(go.Scatter(x=[xi] * len(members), y=members, mode="markers+lines",
-                                     marker=dict(color="#333", size=10), line=dict(color="#333", width=2),
+                                     marker=dict(color=color, size=10),
+                                     line=dict(color=color, width=2),
                                      showlegend=False, hoverinfo="skip"), row=2, col=1)
     fig.update_yaxes(title="species", row=1, col=1)
     fig.update_yaxes(tickmode="array", tickvals=list(range(len(gsamples))),
                      ticktext=[esc(x) for x in gsamples], row=2, col=1, autorange="reversed")
     fig.update_xaxes(showticklabels=False, row=2, col=1)
-    return fig_html(style(fig, 460, f"Shared corrected-UMI species across {esc(group)} (top {len(masks)} intersections)"))
+    fig.update_layout(showlegend=False)
+    return fig_html(style(fig, 460,
+                          f"Shared corrected-UMI species across {esc(group)} "
+                          f"(top {len(masks)} intersections)"))
 
 
 def _read_signatures(frags_path):
@@ -292,8 +538,21 @@ def _read_signatures(frags_path):
     return fr.group_by("read_acc").agg(pl.col("fragment_id").sort().str.join("|").alias("sig"))
 
 
-def fig_purity(samples):
-    parts = []
+BINS = [(2, 2), (3, 4), (5, 9), (10, 29), (30, 99), (100, 10 ** 9)]
+
+
+def _bin_label(lo, hi):
+    return f"{lo}" if lo == hi else (f"{lo}+" if hi > 10 ** 8 else f"{lo}-{hi}")
+
+
+def fig_purity(samples, gcol):
+    """Purity per GROUP, not pooled.
+
+    This used to concat every sample into one aggregate, which is precisely the comparison the
+    report exists to make impossible: a pooled purity curve cannot show that one arm's UMI groups
+    are dirtier than another's, and it silently lets the deepest sample dominate the mixture.
+    """
+    per_group = {}
     for s in samples:
         if not s["fused"].exists() or not s["frags"] or not Path(s["frags"]).exists():
             continue
@@ -304,42 +563,48 @@ def fig_purity(samples):
             if joined.height == 0:
                 continue
             grp = (joined.group_by("fused_seq_corrected")
-                   .agg(pl.len().alias("size"),
-                        pl.col("sig").value_counts().alias("_vc")))
-            # dominant signature share per UMI group
+                   .agg(pl.len().alias("size"), pl.col("sig").value_counts().alias("_vc")))
             grp = grp.with_columns(
                 pl.col("_vc").list.eval(pl.element().struct.field("count").max()).list.first().alias("dom")
             ).with_columns((pl.col("dom") / pl.col("size")).alias("purity")).drop("_vc")
-            parts.append(grp.select("size", "purity"))
+            per_group.setdefault(s["group"], []).append(grp.select("size", "purity"))
         except Exception as exc:  # noqa: BLE001
             sys.stderr.write(f"[purity] skip {s['name']}: {exc}\n")
-    if not parts:
+    if not per_group:
         return "<p class='small'>Purity QC skipped (decode fragments not available).</p>"
-    allg = pl.concat(parts).filter(pl.col("size") >= 2)
-    if allg.height == 0:
-        return "<p class='small'>No multi-read UMI groups for the purity QC.</p>"
-    bins = [(2, 2), (3, 4), (5, 9), (10, 29), (30, 99), (100, 10 ** 9)]
-    labels, frac_pure, mean_pur, ngroups = [], [], [], []
-    for lo, hi in bins:
-        sub = allg.filter((pl.col("size") >= lo) & (pl.col("size") <= hi))
-        if sub.height == 0:
-            continue
-        labels.append(f"{lo}" if lo == hi else (f"{lo}+" if hi > 10 ** 8 else f"{lo}-{hi}"))
-        frac_pure.append(100 * sub.filter(pl.col("purity") >= 0.999).height / sub.height)
-        mean_pur.append(100 * float(sub["purity"].mean()))
-        ngroups.append(sub.height)
+
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=labels, y=frac_pure, name="% pure groups", marker_color="#54A24B",
-                         customdata=ngroups, hovertemplate="%{y:.1f}% pure<br>%{customdata} groups<extra></extra>"))
-    fig.add_trace(go.Scatter(x=labels, y=mean_pur, name="mean purity", mode="lines+markers",
-                             line=dict(color="#E45756")))
-    fig.update_xaxes(title="UMI group size (reads)")
-    fig.update_yaxes(title="% (pure groups / mean purity)", range=[0, 105])
-    return fig_html(style(fig, 420, "Validity: ligand-signature purity vs UMI group size"))
+    drawn = False
+    for g, parts in per_group.items():
+        allg = pl.concat(parts).filter(pl.col("size") >= 2)
+        if allg.height == 0:
+            continue
+        labels, frac_pure, ngroups = [], [], []
+        for lo, hi in BINS:
+            sub = allg.filter((pl.col("size") >= lo) & (pl.col("size") <= hi))
+            if sub.height == 0:
+                continue
+            labels.append(_bin_label(lo, hi))
+            frac_pure.append(100 * sub.filter(pl.col("purity") >= 0.999).height / sub.height)
+            ngroups.append(sub.height)
+        if not labels:
+            continue
+        drawn = True
+        fig.add_trace(go.Bar(
+            x=labels, y=frac_pure, name=esc(g), legendgroup=g,
+            marker_color=gcol.get(g, GREY), customdata=ngroups,
+            hovertemplate="%{y:.1f}% pure<br>%{customdata:,} groups<extra>" + esc(g) + "</extra>"))
+    if not drawn:
+        return "<p class='small'>No multi-read UMI groups for the purity QC.</p>"
+    fig.update_xaxes(title="UMI group size (reads)", categoryorder="array",
+                     categoryarray=[_bin_label(lo, hi) for lo, hi in BINS])
+    fig.update_yaxes(title="% of UMI groups with a single ligand signature", range=[0, 105])
+    fig.update_layout(barmode="group")
+    return fig_html(style(fig, 440, "Validity: ligand-signature purity vs UMI group size, by group"))
 
 
-def fig_collision(samples, species, summaries):
-    names, observed, expected = [], [], []
+def fig_collision(samples, species, summaries, gcol):
+    order, observed, expected = [], [], []
     for s in samples:
         d = summaries.get(s["name"], {})
         merged = d.get("n_species_merged")
@@ -352,17 +617,24 @@ def fig_collision(samples, species, summaries):
         L = float(sp["umi"].str.len_chars().mean() or 0)
         nbhd = 7 * L  # ~ Levenshtein-1 neighbourhood size (subs 3L + indels ~4L)
         exp = (n_raw * (n_raw - 1) / 2.0) * nbhd / (4.0 ** L) if L else 0.0
-        names.append(s["name"])
+        order.append(s)
         observed.append(int(merged))
         expected.append(exp)
-    if not names:
+    if not order:
         return "<p class='small'>Collision null model unavailable.</p>"
+    names = [s["name"] for s in order]
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=names, y=observed, name="observed ed≤1 merges", marker_color="#4C78A8"))
-    fig.add_trace(go.Bar(x=names, y=expected, name="expected by chance", marker_color=GREY))
+    fig.add_trace(go.Bar(x=names, y=observed, name="observed ed≤1 merges",
+                         marker=dict(color=[gcol.get(s["group"], GREY) for s in order])))
+    fig.add_trace(go.Bar(x=names, y=expected, name="expected by chance",
+                         marker=dict(color=GREY, opacity=0.45,
+                                     pattern=dict(shape="/", solidity=0.35))))
+    for x in group_dividers(order):
+        fig.add_vline(x=x, line_color=GREY, line_width=1, opacity=0.5)
+    group_band(fig, order, yshift=6)
     fig.update_yaxes(title="UMI merges", type="log")
     fig.update_layout(barmode="group")
-    return fig_html(style(fig, 400, "Collision null model: observed corrections vs chance"))
+    return fig_html(style(fig, 420, "Collision null model: observed corrections vs chance", top=88))
 
 
 # --------------------------------------------------------------------------- assemble
@@ -370,7 +642,7 @@ def main():
     if not BASE or not BASE.exists():
         sys.stderr.write(f"[FATAL] L2F_BASE not found: {BASE}\n")
         return 1
-    meta = load_meta()
+    meta = load_meta(SAMPLES_TSV)
     samples = discover(meta)
     if not samples:
         OUT.write_text("<!doctype html><meta charset='utf-8'><p>No UMI samples discovered.</p>")
@@ -378,7 +650,11 @@ def main():
         return 0
     species = {s["name"]: load_species(s) for s in samples}
     summaries = {s["name"]: load_summary(s) for s in samples}
+    cplx = load_table(COMPLEXITY_TSV)
+    collapse = load_table(COLLAPSE_TSV)
     gcol = group_color(samples)
+    if not cplx:
+        sys.stderr.write("[warn] no complexity table (L2F_COMPLEXITY); C_eff panels will be empty\n")
 
     H = [
         "<!doctype html><html><head><meta charset='utf-8'>",
@@ -389,27 +665,58 @@ def main():
         "</head><body>",
         "<h1>UMI characterisation — cross-sample</h1>",
         "<p class='small'>Descriptive QC over corrected UMI species (mode <code>correct</code>). "
-        "This is a workflow output — no biological conclusions are drawn.</p>",
-        summary_table(samples, summaries),
+        "This is a workflow output — no biological conclusions are drawn. Every figure is coloured "
+        "by the config <code>group</code>; the initial library is the shared R0 baseline both arms "
+        "start from, and is drawn grey and dashed throughout.</p>",
+        color_key_html(gcol, samples),
+        summary_table(samples, summaries, cplx, gcol),
+
+        "<h2>Effective complexity (C<sub>eff</sub>)</h2>",
+        "<p class='small'><code>C_eff = 1 / P(two random distinct reads came from the same original "
+        "molecule)</code> — the inverse-Simpson complexity of the molecule pool. Unlike a distinct-UMI "
+        "count, it does not inflate with sequencing depth, so it is the one complexity number "
+        "comparable across these samples (whose depth spans ~6×).</p>",
+        "<p class='small'><b>C<sub>eff</sub> is a lower bound on richness, never a headcount.</b> "
+        "By Cauchy–Schwarz it equals the true number of lineages only for a perfectly even pool, and "
+        "sits far below it for a skewed one. Two consequences worth stating plainly: (1) "
+        "<code>C_eff</code> here <em>exceeds</em> the observed distinct-UMI count in every sample — "
+        "no contradiction, since the bound is against the <em>true</em> richness, not the "
+        "<em>observed</em> one; it simply says the pool is nowhere near exhausted even at R5. (2) A "
+        "<em>fall</em> in <code>C_eff</code> means the pool concentrated, but that can be lineages "
+        "being <b>lost</b> or the survivors becoming <b>uneven</b>, and <code>C_eff</code> alone "
+        "cannot tell you which — so read it next to <code>dup pairs</code>, <code>max nᵢ</code> and "
+        "<code>top10 %S</code> below. Lost lineages do not create high-count UMIs; PCR skew and "
+        "clonal expansion do.</p>",
+        fig_ceff_trajectory(samples, cplx, collapse, gcol),
+        ceff_table(samples, cplx, collapse, gcol),
+        fig_depth_complexity(samples, cplx, gcol),
+
         "<h2>Abundance</h2>",
+        "<p class='small'>⚠ Both panels below are species counts and are therefore <b>depth-sensitive</b>: "
+        "the rank-abundance curve's length is the species count, and D50/D90 are proportions over that "
+        "same depth-dependent denominator. Read them for shape, not for cross-sample magnitude. Within "
+        "a group, rounds are told apart by line dash.</p>",
         fig_rank_abundance(samples, species, gcol),
         fig_complexity(samples, species, gcol),
         "<h2>Species overlap</h2>",
+        "<p class='small'>⚠ Shared-species counts grow with the depth of <b>both</b> samples, so an UpSet "
+        "built on unequal depths overstates the overlap of the deeper pair. Rarefaction is not meaningful "
+        "here (it would change set membership), so treat these intersections as qualitative.</p>",
     ]
     exp_groups = list(dict.fromkeys(s["group"] for s in samples if not s["is_baseline"]))
     base_name = next((s["name"] for s in samples if s["is_baseline"]), None)
     for g in exp_groups:
         gs = ([base_name] if base_name else []) + [s["name"] for s in samples
                                                    if s["group"] == g and not s["is_baseline"]]
-        H.append(fig_upset(g, gs, species))
+        H.append(fig_upset(g, gs, species, gcol.get(g, GREY)))
     H += [
         "<h2>Validity QC</h2>",
-        fig_purity(samples),
-        fig_collision(samples, species, summaries),
+        fig_purity(samples, gcol),
+        fig_collision(samples, species, summaries, gcol),
         "</body></html>",
     ]
     OUT.write_text("\n".join(x for x in H if x))
-    print(f"[umi report] {len(samples)} samples -> {OUT}")
+    print(f"[umi report] {len(samples)} samples, {len(cplx)} complexity rows -> {OUT}")
     return 0
 
 
@@ -418,9 +725,10 @@ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:2rem 
 h1{font-size:1.6rem}h2{font-size:1.2rem;margin-top:2rem;border-bottom:1px solid #eee;padding-bottom:.3rem}
 table{border-collapse:collapse;font-size:.85rem}th,td{border:1px solid #e2e2e2;padding:.25rem .5rem;text-align:left}
 th{background:#f6f8fa}td.num{text-align:right;font-variant-numeric:tabular-nums}
+th[title]{cursor:help;text-decoration:underline dotted 1px}
 .small{color:#666;font-size:.85rem}code{background:#f0f2f4;padding:.05rem .3rem;border-radius:3px}
 @media(prefers-color-scheme:dark){body{background:#15181c;color:#e6e6e6}th{background:#20242a}
-th,td{border-color:#333}h2{border-color:#333}code{background:#20242a}}
+th,td{border-color:#333}h2{border-color:#333}code{background:#20242a}.small{color:#9aa4ae}}
 </style>"""
 
 

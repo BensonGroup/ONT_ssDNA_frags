@@ -2,7 +2,8 @@
 #
 #   raw fastqs -> nanocomp                 (cross-sample read QC; parallel branch, gates nothing)
 #   clean -> train_hmm -> pychopper -> decode -> dedup -> featurecount -> {report_sample, report_cross}
-#                                                    └─► umi_correct -> umi_matrix -> report_umi_cross
+#                                                    └─► umi_correct ─┬─► umi_matrix
+#                                                                     └─► umi_complexity ─► report_umi_cross
 #
 # `umi.mode` (default `correct`) drives the UMI stage. The `dedup/` tree always QC-filters and feeds
 # featurecount/reports (it COLLAPSES to molecules only in mode `dedup`). Mode `correct` additionally
@@ -33,9 +34,14 @@ rule all:
         f"{OUTDIR}/clean/clean_summary.tsv",
         f"{OUTDIR}/preprocess/batch_summary.tsv",
         *([f"{OUTDIR}/dedup/umi_dedup_summary.tsv"] if UMI_STAGE_ON else []),
-        # UMI characterisation branch (mode `correct`): per-group corrected-UMI x sample matrices +
-        # the cross-sample UMI report. Independent of the fragment reports above.
+        # UMI characterisation branch (mode `correct`): per-group corrected-UMI x sample matrices,
+        # the depth-robust effective-complexity tables, and the cross-sample UMI report. Independent
+        # of the fragment reports above. The two complexity TSVs are listed even though the report
+        # pulls them in transitively — they are outputs in their own right and survive if the report
+        # is ever switched off.
         *([f"{OUTDIR}/umi/{g}.umi_x_sample.mtx" for g in GROUPS_EXP] if UMI_CORRECT_ON else []),
+        *([f"{OUTDIR}/umi/umi_complexity.tsv",
+           f"{OUTDIR}/umi/umi_collapse.tsv"] if UMI_CORRECT_ON else []),
         *([f"{OUTDIR}/umi/umi_report_cross.html"] if UMI_CORRECT_ON else []),
 
 

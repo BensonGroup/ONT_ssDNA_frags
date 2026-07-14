@@ -20,7 +20,6 @@ the cell-line / round of each sample is parsed from its name, and the construct 
 
 Run: pixi run python workflow/build_featurecount_report_cross.py
 """
-import html
 import math
 import os
 import re
@@ -33,6 +32,13 @@ from plotly.offline import get_plotlyjs
 from ligand_vocab import (
     anchor_set, class_colors, class_order, parse_feature, parse_log, read_expected, GREY, PALETTE,
 )
+# The GROUP layer is shared with the umi/fragvec cross reports so a cell line is the same colour in
+# all three. ligand_vocab's GREY/PALETTE stay: they colour fragment CLASSES, a different axis.
+from report_lib import (
+    BASELINE_GREY, BASELINE_GROUP, color_key_html, esc, fig_html, group_color, load_meta,
+)
+from report_lib import group_band as _group_band
+from report_lib import group_dividers as _group_dividers
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = Path(os.environ.get("L2F_BASE", ROOT / "ligand2frags_new2"))
@@ -44,34 +50,24 @@ _r0 = os.environ.get("L2F_R0_STEM", str(ROOT / "ligand2frags_new2" / "2026initia
 R0_STEM = (Path(_r0) if _r0 else None)
 if R0_STEM is not None and not R0_STEM.is_absolute():
     R0_STEM = ROOT / R0_STEM
-R0_LINE = "library"          # pseudo cell-line label for the shared baseline
 OUT = BASE / "cross_sample_featurecount_report.html"
 
 # Optional per-sample metadata written by Snakemake from the config `samples` table
-# (TSV: name<TAB>group<TAB>round<TAB>idx). When present it is authoritative: `group` becomes
+# (TSV: name<TAB>group<TAB>round<TAB>idx<TAB>role). When present it is authoritative: `group` becomes
 # the grouping/ordering axis and `round`/`idx` order samples within and across groups. Absent
 # (e.g. a standalone run), the script falls back to parsing group+round from the sample name.
+#
+# The metadata now carries the initial library's row too, so the baseline's group comes from the
+# config like every other sample's. It used to be hardcoded here as "library" while the umi and
+# fragvec reports hardcoded "initial" -- three reports, three names for one sample, which only
+# became visible once they started sharing a colour key.
 _meta_path = os.environ.get("L2F_SAMPLES", "")
-SAMPLE_META = {}
-if _meta_path and Path(_meta_path).exists():
-    for i, ln in enumerate(Path(_meta_path).read_text().splitlines()):
-        if i == 0 or not ln.strip():          # skip header / blanks
-            continue
-        f = (ln.split("\t") + ["", "", "", ""])[:4]
-        name, group, rnd, idx = (x.strip() for x in f)
-        SAMPLE_META[name] = dict(
-            group=group or name,
-            round=(int(rnd) if rnd not in ("", "None", "null", "NA") else None),
-            idx=(int(idx) if idx else 10**9))
+SAMPLE_META = load_meta(_meta_path)
 
 RC = r"_rc$"
 EPS = 1e-4
 MAXBUCKET = 8                # payload-fragments-per-read tail bucket ("8+"); tail beyond is negligible
 COVBINS = 25                 # coverage-fraction histogram bins over [0, 1]
-
-
-def esc(s):
-    return html.escape(str(s))
 
 
 def fq_lengths(path):
@@ -104,6 +100,14 @@ def sample_group_round(name):
         return m["group"], m["round"], m["idx"]
     line, rnd = parse_sample_name(name)
     return line, rnd, 10**9
+
+
+def baseline_group():
+    """The initial library's config `group` — from the metadata when it is there, else the shared
+    BASELINE_GROUP contract that report_lib.group_color() keys the grey off."""
+    if R0_STEM is not None and R0_STEM.name in SAMPLE_META:
+        return SAMPLE_META[R0_STEM.name]["group"]
+    return BASELINE_GROUP
 
 
 def discover():
@@ -145,7 +149,7 @@ def load_baseline():
                 fused_fq=R0_STEM.parent / f"{R0_STEM.name}.fused_reads.fq",
                 umis=R0_STEM.parent / f"{R0_STEM.name}.umis.parquet",
                 log=R0_STEM.parent / f"{R0_STEM.name}.ligateddna.log",
-                line=R0_LINE, round=0, idx=-1, is_baseline=True)
+                line=baseline_group(), round=0, idx=-1, is_baseline=True)
 
 
 def load(samples):
@@ -260,43 +264,16 @@ def style(fig, height, title=None):
     return fig
 
 
-def fig_html(fig):
-    # plotly.js is inlined ONCE at the top of the page (see PLOTLYJS), so every figure references
-    # the already-loaded global -- order-independent, safe to reorder sections freely.
-    return fig.to_html(full_html=False, include_plotlyjs=False,
-                       default_width="100%", config={"displaylogo": False, "responsive": True})
-
-
+# This report carries the group on `line`, not `group`; the shared helpers take a `key` for exactly
+# that. Thin adapters keep the ~8 existing call sites untouched.
 def line_boundaries(samples):
     """x indices where the group changes (for a vertical separator)."""
-    lines = [s["line"] for s in samples]
-    return [i - 0.5 for i in range(1, len(lines)) if lines[i] != lines[i - 1]]
-
-
-def group_spans(samples):
-    """Contiguous (group, first_index, last_index) runs over the ordered samples — used to
-    place one group label centred above each block of that group's columns."""
-    spans = []
-    for i, s in enumerate(samples):
-        if spans and spans[-1][0] == s["line"]:
-            spans[-1][2] = i
-        else:
-            spans.append([s["line"], i, i])
-    return [(g, a, b) for g, a, b in spans]
+    return _group_dividers(samples, key="line")
 
 
 def group_band(fig, samples, yshift):
-    """One group name centred above each contiguous block of that group's columns.
-
-    Rotated -45°, the same reading direction as the column tick labels below it. A block can be a
-    single column wide — with no sample metadata the groups tie on rank and interleave — and at
-    that pitch horizontal names overlap: clearing them needs pitch > label width (~40px), whereas
-    rotated ones only need pitch·sin45 > label height (~14px). Rotation makes a label ~0.7·(width
-    + height) tall, so every caller reserves extra top margin for it."""
-    for g, a, b in group_spans(samples):
-        fig.add_annotation(x=(a + b) / 2, y=1.0, xref="x", yref="paper", yshift=yshift,
-                           xanchor="center", yanchor="bottom", textangle=-45,
-                           showarrow=False, text=f"<b>{esc(g)}</b>", font=dict(size=11))
+    """One group name centred above each contiguous block of that group's columns."""
+    return _group_band(fig, samples, yshift, key="line")
 
 
 def col_label(s):
@@ -552,14 +529,26 @@ def fig_contrast(d):
 
 # ------------------------------------------------------------------------ multiplicity & quality
 def sample_palette(d):
-    """One stable colour per sample (baseline grey), shared by the multiplicity/quality panels."""
-    cols, i = {}, 0
-    for s in d["samples"]:
-        if s.get("is_baseline"):
-            cols[s["name"]] = GREY
-        else:
-            cols[s["name"]] = PALETTE[i % len(PALETTE)]; i += 1
-    return cols
+    """Sample -> its GROUP's colour (baseline grey), shared by the multiplicity/quality panels.
+
+    It used to hand every sample its own hue off ligand_vocab's PALETTE -- the same list that colours
+    fragment CLASSES elsewhere on this page, so one hue meant "class X" in the heatmap and "sample Y"
+    here. Now colour means group, everywhere, in all three cross reports. Rounds inside a group are
+    told apart by dash (sample_dash) on the line panels, and by position + the group band on the bars.
+    """
+    gcol = group_color(d["samples"], key="line")
+    return {s["name"]: (BASELINE_GREY if s.get("is_baseline")
+                        else gcol.get(s["line"], GREY)) for s in d["samples"]}
+
+
+DASHES = ["solid", "dash", "longdash", "dashdot", "longdashdot"]
+
+
+def sample_dash(s):
+    """Rounds within a group are separated by dash, since hue is now spent on the group."""
+    if s.get("is_baseline") or s["round"] is None:
+        return "dot"
+    return DASHES[(s["round"] - 1) % len(DASHES)]
 
 
 def fig_multiplicity(d):
@@ -572,7 +561,8 @@ def fig_multiplicity(d):
         ys = [100 * d["ppr"][nm].get(x, 0.0) for x in xs]
         fig.add_trace(go.Scatter(
             x=labels, y=ys, mode="lines+markers", name=col_label(s), legendgroup=s["line"],
-            marker=dict(size=5, color=cols[nm]), line=dict(width=1.6, color=cols[nm]),
+            marker=dict(size=5, color=cols[nm]),
+            line=dict(width=1.6, color=cols[nm], dash=sample_dash(s)),
             hovertemplate=f"{col_label(s)}<br>%{{x}} payload frags<br>%{{y:.1f}}% of reads<extra></extra>"))
     fig.update_xaxes(title="payload fragment copies in a read")
     fig.update_yaxes(title="% of reads")
@@ -590,7 +580,8 @@ def fig_quality(d):
         ys = [100 * d["edh"][nm].get(x, 0.0) for x in xs]
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines+markers", name=col_label(s), legendgroup=s["line"],
-            marker=dict(size=5, color=cols[nm]), line=dict(width=1.6, color=cols[nm]),
+            marker=dict(size=5, color=cols[nm]),
+            line=dict(width=1.6, color=cols[nm], dash=sample_dash(s)),
             hovertemplate=f"{col_label(s)}<br>edit distance %{{x}}<br>%{{y:.1f}}% of calls<extra></extra>"))
     fig.update_xaxes(title="edit distance (payload calls)", dtick=1)
     fig.update_yaxes(title="% of calls")
@@ -647,7 +638,7 @@ def fig_coverage(d):
         ys = [100 * d["cov"][nm].get(i, 0.0) for i in range(COVBINS)]
         fig.add_trace(go.Scatter(
             x=centers, y=ys, mode="lines", name=col_label(s), legendgroup=s["line"],
-            line=dict(width=1.8, color=cols[nm]),
+            line=dict(width=1.8, color=cols[nm], dash=sample_dash(s)),
             hovertemplate=f"{col_label(s)}<br>~%{{x:.0f}}% covered<br>%{{y:.1f}}% of reads<extra></extra>"))
     # x starts at 60: under 0.2% of any sample's reads fall below that, and the clip gives the
     # informative 60-100 region ~2.5x the width.
@@ -725,6 +716,10 @@ def main():
         f'<p class="subtitle">Per-read ligand-fragment profiles of {n_real} decoded samples '
         f'({esc(", ".join(lines))}){r0_note}, lined up feature-by-feature. Charts are interactive — '
         "hover for exact numbers, click legend entries to toggle classes/features, drag to zoom.</p>",
+        '<p class="small">Sample colour = the config <b>group</b> (the same colour for a cell line in '
+        "every cross report); rounds within a group are told apart by line dash. The fragment-class "
+        "colours in the legend below are a different axis — they name features, not samples.</p>",
+        color_key_html(group_color(samples, key="line"), samples, key="line"),
 
         '<div class="callout aim"><p><b>Aim.</b> For every ligand fragment, how does <b>mean copies '
         "per decoded read</b> shift <b>across selection rounds</b> (within a group) and "
