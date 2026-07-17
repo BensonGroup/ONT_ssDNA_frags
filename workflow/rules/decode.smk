@@ -8,8 +8,8 @@
 #
 # Declared outputs are the ones consumed downstream: fragments/umis/log, fused_reads.fq (used
 # opportunistically by the cross-report coverage panel), and fused/trimmed.parquet (required by
-# `rule dedup`). The decoder also writes truncated.fq alongside; it stays UNDECLARED because
-# umi_dedup.py treats it as optional and nothing guarantees the decoder emits it for a sample with
+# `rule covfilt`). The decoder also writes truncated.fq alongside; it stays UNDECLARED because
+# umi_filter.py treats it as optional and nothing guarantees the decoder emits it for a sample with
 # zero truncated reads — a declared-but-absent output would raise MissingOutputException and take
 # this rule's *valid* outputs down with it.
 rule decode:
@@ -26,9 +26,9 @@ rule decode:
         log=f"{OUTDIR}/{{decbase}}/{{sample}}/{{sample}}.ligateddna.log",
     wildcard_constraints:
         # The decoder owns ONLY the raw trees. The shared `decbase` constraint in common.smk is
-        # wide enough to cover dedup/ so that featurecount/report_sample can serve either tree;
-        # without this per-rule narrowing, `decode` would also match dedup/<s>/<s>.fragments.parquet
-        # and collide with `rule dedup`.
+        # wide enough to cover the clean umi/ tree so featurecount/report_sample can serve either --
+        # that is what gives us two fragment reports. Without this per-rule narrowing, `decode` would
+        # also match umi/<s>/<s>.fragments.parquet and collide with `rule jackpot_apply`.
         decbase="decode|decode_initial",
     threads: config["threads"]["decode"]
     params:

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Pure UMI-classification helpers for the ligand2frags dedup pipeline.
+"""Pure UMI-classification helpers for the ligand2frags UMI stage.
 
 These are the single source of truth for STEP 1 (garbage-UMI classification). They are
 deliberately dependency-free -- NO polars / numpy imports at module top level -- so the
 logic can be unit-tested with a plain ``python3`` (no pixi env required), and so the
-per-sample driver (``umi_dedup.py``) and any QC script call exactly the same code.
+per-sample driver (``umi_filter.py``) and any QC script call exactly the same code.
 
 Public API:
     maxrun(seq)                       -> longest run of identical characters (int, 0 for "")
@@ -20,7 +20,7 @@ Run the self-test:  python3 workflow/scripts/umi_filter_lib.py
 """
 from __future__ import annotations
 
-# --- defaults (mirrored by umi_dedup.py CLI flags --max-homopolymer / --max-base-frac) ---
+# --- defaults (mirrored by umi_filter.py CLI flags --max-homopolymer / --max-base-frac) ---
 DEFAULT_MAX_HOMOPOLYMER = 8      # drop if the longest homopolymer run is >= this
 DEFAULT_MAX_BASE_FRAC = 0.7      # drop if any single base's fraction is >= this
 UMI_LEN_MIN = 10                 # each of the read's two UMI lengths must be within

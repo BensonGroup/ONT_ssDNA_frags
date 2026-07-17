@@ -2,22 +2,29 @@
 
 A Snakemake workflow for the Nanopore ligated-DNA selection screen: genomic depletion → primer-HMM
 training → pychopper preprocessing → cONcat (new) decode → per-read feature counts → interactive HTML
-reports, plus two independent analysis branches off `decode`: **UMI processing** (filter / correct /
-dedup) and **fragment-vector quantification** (the two-axis abundance + incidence readout).
+reports. One UMI spine (QC-filter → ed≤1 correct → jackpot-clean) feeds three readouts: per-fragment
+counts, effective complexity, and **fragment-vector quantification** (the two-axis abundance +
+incidence readout).
 
 ```
 minikow/dorado passed fastq ─┬─► genomic contamination─┐
 (zcat per sample)            └─► length filter         └─┬─► train_hmm ─┐
                                                          │              ▼
-                                                         └────────────► pychopper ──► cONcat ──► dedup ──► featurecount ─┬─► report_sample
-                                                                                       (new)     (new)                   └─► report_cross
+                                                         └────────────► pychopper ──► cONcat ──► covfilt ──► umi_correct ──► jackpot ──► featurecount ─┬─► report_sample
+                                                                                       (new)                                                           └─► report_cross
 ```
 
-The UMI stage is set by `umi.mode` (default **`correct`**): `filter` QC-filters garbage UMIs only;
-`correct` additionally corrects near-identical UMIs (ed≤1) and runs a separate **UMI characterisation
-branch** (per-molecule read counts, a per-group UMI×sample matrix, and a cross-sample UMI report)
-without touching the fragment reports; `dedup` collapses PCR/sequencing duplicates into molecules.
-This data must not be UMI-collapsed, so collapse is **off** by default. See **UMI processing** below.
+`decode_filter.min_coverage` (default **0.9**) drops reads the decoder barely explained — the one
+read-level cut upstream of the fork, so every branch below shares a read set. See **Decode coverage
+filter** below.
+
+The UMI stage is one spine, with no modes: QC-filter garbage UMIs → correct near-identical UMIs
+(ed≤1) → drop the jackpot artefacts the naive R0 library exposes. `umi/` is its clean end, and every
+readout reads it. Nothing is ever **collapsed** — this data must not be UMI-deduplicated. See
+**UMI processing** and **Jackpot filter** below.
+
+There are **two fragment reports**, one either side of the UMI processing (`decode/` raw and `umi/`
+clean); their difference is the read funnel.
 
 Environments are managed by **pixi** (conda-forge + bioconda); orchestration is Snakemake.
 Snakemake is pure Python and architecture-independent — the same workflow runs on `linux-aarch64`
@@ -52,7 +59,7 @@ Then in this repo root:
 1. Create the environments the rules call:
 
    ```bash
-   pixi install -e default      # minimap2, samtools, seqkit, polars, plotly, starcode (clean + dedup + featurecount + reports)
+   pixi install -e default      # minimap2, samtools, seqkit, polars, plotly, starcode (clean + umi + featurecount + reports)
    pixi install -e preprocess   # pychopper, hmmer, hammerpede         (train_hmm + pychopper)
    pixi install -e build        # rust/cargo                            (only if building LigandFrags2 from source)
    ```
@@ -112,10 +119,15 @@ Edit `config/config.yaml`. Point the paths at your data:
   ```
 - **adapters_fasta / pychopper_config / expected_sequences** — per-project; defaults ship in
   `resources/`. The primer HMM is *built each run* from the adapters + the initial-library sample.
+- **decode_filter** — the decode coverage filter (see below). Omit the block and it keeps these defaults.
+  ```yaml
+  decode_filter:
+    enabled: true
+    min_coverage: 0.9      # drop a read whose decoded coverage is < this
+  ```
 - **umi** — the UMI stage (see below). Omit the block entirely and it keeps the defaults shown here.
   ```yaml
   umi:
-    mode: correct          # filter | correct | dedup   (default correct)
     max_homopolymer: 8     # drop a UMI whose longest homopolymer run is >= this
     max_base_frac:   0.7   # drop a UMI where any single base's fraction is >= this
   ```
@@ -123,7 +135,6 @@ Edit `config/config.yaml`. Point the paths at your data:
   ```yaml
   fragvec:
     enabled: true
-    umi_source: corrected  # corrected (needs umi.mode: correct) | raw (stand-alone)
     min_reads: 10          # counts below this are FLAGGED as noise, not dropped
   ```
 - **groups** — every group name used in `samples:`, declared once:
@@ -249,74 +260,107 @@ the principled threshold comes from the `empty` rounds (above).
 `workflow/scripts/effective_complexity.py` is a standalone CLI for the same estimator — useful for
 running the protocol/selection decomposition on an arbitrary set of samples without invoking Snakemake.
 
-## UMI processing (`umi.mode`)
+## Decode coverage filter (`decode_filter`)
 
-After decoding, each read carries two UMIs concatenated into `fused_seq` (~20–24 nt). `umi.mode`
-selects what happens next:
+A read's **decoded coverage** is the fraction of it the decoder explained: Σ(stop − start) over its
+fragment calls (**anchors included** — they are real decoded bases) ÷ its post-trim length from
+`fused_reads.fq`. The decoder's calls never overlap by construction, so the plain sum is exact.
+`workflow/scripts/coverage_lib.py` defines it once; the filter and the cross report both call it,
+so the number a read is judged on and the number the figure draws cannot drift apart.
 
-- **`filter`** — drop garbage UMIs only (non-ACGT, low complexity, or outside the 10–12 nt length
-  window). Every surviving read is kept.
-- **`correct`** (default) — filter, then **correct** each surviving read's UMI to the most-abundant
-  ed≤1 variant by clustering with `starcode -d 1 -s` (spheres, Levenshtein distance 1) and relabelling
-  members to their sphere's centroid. **Nothing is collapsed** — duplicate molecules keep every one of
-  their reads. This additionally runs a separate `umi/` characterisation branch (below); the fragment
-  featurecount/reports are unaffected.
-- **`dedup`** — filter + correct + **collapse** to one representative read per molecule (highest
-  whole-read base-quality sum, the Picard MarkDuplicates convention). The collapsed tree feeds
-  featurecount/reports (classic UMI dedup).
+Reads below `min_coverage` are **dropped**. A read well short of 1.0 is mostly sequence the decoder
+could not resolve, yet it still carries a UMI and a fragment vector and so inflates every downstream
+count as if it were clean.
+
+This is the **only** read-level drop between decode and the UMI spine — `umi/`
+and `fragvec/` all read the `covfilt/` tree, so no branch can disagree with another about which
+reads exist:
+
+```
+decode/  ──►  covfilt/  ──►  umicorr/  ──►  umi/   ──┬─►  featurecount ──►  fragment report [CLEAN]
+  (raw,        cov >= 0.9    (corrected)   (jackpot   ├─►  C_eff, UMI matrix/report
+   kept)                                    -clean)   └─►  fragvec/ ──► vector matrix/report
+   │
+   └─►  featurecount  ──►  fragment report [RAW]
+```
+
+The raw `decode/` tree is never modified. `covfilt/<s>/<s>.coverage.parquet` records **every**
+read's coverage *before* filtering — it is a first-class output, and the cross report's coverage
+panel renders it (drawing the cut as a dotted line) rather than recomputing on the filtered tree,
+which would show a distribution mysteriously truncated at the threshold. Per-sample counts land in
+`covfilt/coverage_summary.tsv`.
+
+With `enabled: false` the branches read `decode/` directly and no `covfilt/` tree is built.
+
+## UMI processing
+
+After decoding, each read carries two UMIs concatenated into `fused_seq` (~20–24 nt). One spine, no
+modes:
+
+1. **QC-filter** — drop garbage UMIs (non-ACGT, low complexity, or outside the 10–12 nt window).
+2. **Drop anchor-only reads** — a read carrying nothing but the backbone decoded no ligand, so it
+   must not inflate a molecule's read count.
+3. **Correct** — relabel each survivor's UMI to the most-abundant ed≤1 variant, by clustering with
+   `starcode -d 1 -s` (spheres, Levenshtein distance 1). **Nothing is collapsed** — duplicate
+   molecules keep every one of their reads. Output: `umicorr/`.
+4. **Jackpot-clean** — see below. Output: `umi/`, the clean end of the spine.
 
 Levenshtein rather than Hamming distance is deliberate: the UMIs are variable length and ONT's
 dominant error mode is indels. `starcode` is pinned to a single thread (`-t 1`) for byte-reproducible
-cluster output (~0.5 s/sample).
+cluster output (~0.5 s/sample). Correction is the only stage that runs it.
 
-**Fragment pipeline.** In every mode the `dedup/` tree (QC-filtered, or collapsed in `dedup` mode)
-feeds `featurecount` and the fragment reports — correction never changes fragment counts. Each
-sample's dedup QC (`.umi_counts.tsv`, `.umi_clusters.tsv`, `.umi_audit.parquet`, and its
-`.umi_dedup_summary.tsv` row) sits in its own directory; the concatenation is `dedup/umi_dedup_summary.tsv`.
+There is **no `umi.mode`**. It used to pick between `filter` and `correct`, back when a filter-only
+tree fed `featurecount`; featurecount now reads `decode/` and `umi/`, so that tree had no consumer.
+`dedup` never applied to this data at all (see `clarification.md`). A stale key is **rejected**, not
+ignored.
 
-**UMI characterisation branch (`correct`).** A separate `umi/` tree (sibling of `decode/`/`dedup/`,
-with `umi_initial/` for the R0 library), independent of the fragment reports. A read is kept only if
-it passes the UMI QC filter **and** decodes at least one **payload** fragment — *anchor-only* reads
-(valid UMI, backbone features only) are **dropped**, so a molecule's read count reflects only reads
-that actually decoded a ligand. Anchors come from the umis parquet via `ligand_vocab.anchor_set`
-(both orientations), the same authoritative source `build_featurecounts.py` uses; the fragment
-pipeline is unaffected and still counts every read. Per sample `umi/<s>/`:
+Each sample's `umicorr/<s>/<s>.umi_audit.parquet` is one row per **input** read: a dropped read is
+still there, carrying the class that explains why. Nothing else records that.
 
-- `<s>.fused.parquet` — one row per kept (payload-bearing) read: `read_acc, strand, fused_seq,
-  fused_len, fused_seq_corrected, umi_read_count` (reads sharing this read's corrected UMI here).
-- `<s>.umi_species.tsv` — corrected `fused_seq  n_reads` (the matrix substrate).
-- `<s>.umi_summary.tsv` — per-sample filter/correction counts (incl. `dropped_no_payload`).
+**Readouts.** `umi/` feeds all three: `featurecount` (the clean fragment report), `umi_complexity`
+(C_eff) + `umi_matrix` + the cross-sample UMI report, and `fragvec`. They share one read set by
+construction.
 
-Per **group** (config `group` — every group except `initial`, the `empty` arm included: it is a peer
-arm, not a special case), one corrected-UMI × sample matrix with the R0 library as the
-**first column** (no all-sample matrix): `umi/<group>.umi_x_sample.long.parquet` (`fused_umi,
-sample, n_reads`; canonical), `.mtx` (Matrix Market triplets), and `.{umis,samples}.tsv` (row/column
-labels). Finally `umi/umi_report_cross.html` — a descriptive QC report (rank-abundance, D50/D90
-complexity, per-group species-overlap UpSet, and validity QC: UMI-group ligand-signature purity vs
-size and a collision null model). It draws no biological conclusions.
+## Jackpot filter (`jackpot`)
 
-## Run (from the repo root)
+A **jackpot** is a clonotype whose reads collapse onto very few UMIs: thousands of physical copies of
+one construct whose UMI slot failed to randomise, so they pile onto ~one barcode. Ranked by raw
+abundance it looks like a top hit; behaviourally it is an amplification/synthesis artefact.
 
-Using the `concatsmk` alias from prerequisites step 4 (or the full `pixi run -e snakemake snakemake` prefix):
+**Detection is naive-library only, and the blacklist is applied everywhere.** That asymmetry is
+forced. The ratio `n_reads / n_umis` has two possible causes — one molecule amplified into thousands
+of reads (artefact), or a clone genuinely enriched by selection (a real hit). Only in R0, where every
+construct starts at comparable abundance, is the second cause excluded by construction, so only there
+is the statistic identifiable. Detecting on a selected round would blacklist true winners.
 
-```bash
-concatsmk -n --printshellcmds --configfile /abs/path/to/your_config.yaml         # dry-run: inspect the DAG without executing
-concatsmk --cores 18 --configfile /abs/path/to/your_config.yaml                # full run (reads config/config.yaml by default)
-concatsmk --cores 8 /abs/path/to/results/dedup/your.featurecount_report.html    # build one target
-concatsmk check_all --cores 4        # optional: validate every featurecount against its raw parquet
-concatsmk -n --config umi='{"mode": "dedup"}'    # dry-run WITH UMI collapse (classic dedup)
-concatsmk -n --config umi='{"mode": "filter"}'   # dry-run filter-only (no correction branch)
-python3 workflow/scripts/umi_filter_lib.py             # optional: UMI-classification self-test
+```
+umicorr_initial/  ──►  jackpot detect  ──►  <R0>.umi_blacklist.tsv  + 2 audit reports
+                                              └──►  jackpot apply (every sample)  ──►  umi/
 ```
 
-Note the `--` separator when a target follows `--configfile` (which takes several values):
-`concatsmk -n --configfile my.yaml -- results/dedup/A549_R1/A549_R1.fragments.parquet`.
+`ratio_max = 10` is **cited**: longread_umi `BIN_CLUSTER_RATIO=10` (Karst et al., Nat Methods 2021).
+A data-driven robust cut (median + k·MAD of log10 ratio) is computed and **reported for
+transparency**, never acted on. `min_reads` is not a key — it reuses `fragvec.min_reads`, because
+the clone table the blacklist is drawn from is restricted by that same floor.
+
+This runs **before C_eff**, deliberately: the complexity weighting is quadratic, so an artefact in
+the top lineage corrupts it more than any biology can (`clarification.md`).
+
+Two limits worth stating, both in the reports:
+
+- The R0 library is the **least** jackpot-susceptible sample in the study (jackpotting is worst when
+  few templates enter the PCR). This catches the synthesis/aliquot artefacts already in the pool; it
+  does **not** catch a jackpot generated inside a bottlenecked selected round.
+- This is a **filter, not a deduplication** — it drops a named, audited set of artefact barcodes.
+  High-count lineages are the signal here and are never collapsed.
+
+With `enabled: false` the spine ends at `umicorr/` and every readout resolves there instead.
 
 ## Outputs (under `config.outdir`, default `results/`)
 
 
-Below, `<tree>` is `dedup` (the UMI stage always QC-filters, so featurecount/reports run on the
-`dedup/` tree; in mode `dedup` it is the collapsed tree); the initial library lives in `dedup_initial/`.
+Below, `<tree>` is `umi` — the clean end of the UMI spine, which every readout reads; the initial
+library lives in `umi_initial/`. With `jackpot.enabled: false` it is `umicorr` instead.
 
 | Path                                                                                                          | What                                                                         |
 | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -324,9 +368,12 @@ Below, `<tree>` is `dedup` (the UMI stage always QC-filters, so featurecount/rep
 | `hmm/<adapters>.hmm` (+ hmmpress DB)                                                                          | trained primer HMM                                                           |
 | `preprocess/<sample>/<sample>.full_length.fq` (+ rescued/…/stats/report/bed), `preprocess/batch_summary.tsv` | pychopper outputs                                                            |
 | `decode/<sample>/…` (every non-`initial` sample), `decode_initial/<initial>/…`                                            | LigandFrags2 decode (fragments/umis/fused/trimmed parquet, fused_reads.fq, ligateddna.log) |
-| `dedup/<sample>/…` (every non-`initial` sample), `dedup_initial/<initial>/…`                                              | the same artifacts, QC-filtered (and, with dedup on, reduced to one representative read per UMI molecule); `ligateddna.log` gains a provenance block |
-| `dedup/<sample>/<sample>.{umi_counts,umi_clusters}.tsv`, `.umi_audit.parquet`, `.umi_dedup_summary.tsv`        | that sample's UMI QC, beside the data it describes: UMI counts, starcode clusters (empty unless dedup on), a one-row-per-input-read audit, and its summary row |
-| `dedup/umi_dedup_summary.tsv`                                                                                 | all samples: reads in → reads kept (molecules out with dedup on), drop classes, duplicate rate |
+| `decode/<sample>/<sample>.coverage.parquet` (+ `decode_initial/`)                                             | every read's decoded coverage, measured on decode and ALWAYS built. The filter selects on it and the cross report renders it; neither recomputes it |
+| `covfilt/<sample>/…` (every non-`initial` sample), `covfilt_initial/<initial>/…`, `covfilt/coverage_summary.tsv` | the same artifacts with low-coverage reads dropped, plus the per-sample drop row; `ligateddna.log` gains a provenance block. Absent when `decode_filter.enabled: false` |
+| `umicorr/<sample>/…` (+ `umicorr_initial/`)                                                                   | garbage-UMI and anchor-only reads dropped, surviving UMIs corrected to their ed≤1 centroid. NOT a readout — it still carries the jackpot artefacts |
+| `umicorr/<sample>/<sample>.umi_audit.parquet`                                                                 | one row per **input** read: its features, its class, and whether it survived. The only per-read record of why a read was dropped |
+| `umi/<sample>/…` (+ `umi_initial/`)                                                                           | the clean end of the spine: the same artifacts with the jackpot blacklist applied and every aggregate re-derived. What featurecount, C_eff and fragvec read |
+| `jackpot/<initial>.umi_blacklist.tsv`, `.umi_blacklist_summary.tsv`, `.fragvec_jackpot_report.html`, `.umi_jackpot_report.html` | the artefact barcodes the R0 library exposed, the thresholds and provenance, and the two audit reports |
 | `umi/<sample>/<sample>.fused.parquet`, `.umi_species.tsv`, `.umi_summary.tsv` (+ `umi_initial/`)             | (mode `correct`) corrected UMIs over **payload-bearing reads only**: per-read `fused_seq_corrected` + `umi_read_count`, the species→count table, and filter/correction counts |
 | `umi/<group>.umi_x_sample.{long.parquet,mtx,umis.tsv,samples.tsv}`                                            | (mode `correct`) one per group except `initial` (**`empty` included**): corrected-UMI × sample read-count matrix, R0 library as the first column |
 | `umi/umi_report_cross.html`                                                                                   | (mode `correct`) cross-sample UMI QC report (abundance, species overlap, validity) |

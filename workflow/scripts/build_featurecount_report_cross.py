@@ -52,6 +52,18 @@ if R0_STEM is not None and not R0_STEM.is_absolute():
     R0_STEM = ROOT / R0_STEM
 OUT = BASE / "cross_sample_featurecount_report.html"
 
+# The RAW decode tree, where `rule coverage` wrote each sample's per-read <S>.coverage.parquet.
+# The coverage panel RENDERS that and computes nothing: coverage is a property of the DECODE step,
+# whereas BASE here is the umifilt/ tree, which sits downstream of both the coverage filter and the
+# UMI filter. Measuring it there would describe an already-cut read set -- a distribution truncated
+# at the threshold, which reads as a bug rather than as the filter working.
+# L2F_MIN_COVERAGE only draws the cut line; it never selects reads here, and is "" when the filter
+# is off (nothing was cut, so there is no line).
+COV_BASE = os.environ.get("L2F_COV_BASE", "").strip()
+R0_COV = os.environ.get("L2F_R0_COV", "").strip()
+_mc = os.environ.get("L2F_MIN_COVERAGE", "").strip()
+MIN_COVERAGE = float(_mc) if _mc else None
+
 # Optional per-sample metadata written by Snakemake from the config `samples` table
 # (TSV: name<TAB>group<TAB>round<TAB>idx -- there is no `role` column; the group decides everything,
 # see report_lib's reserved names). When present it is authoritative: `group` becomes the
@@ -71,18 +83,9 @@ MAXBUCKET = 8                # payload-fragments-per-read tail bucket ("8+"); ta
 COVBINS = 25                 # coverage-fraction histogram bins over [0, 1]
 
 
-def fq_lengths(path):
-    """read_acc -> sequence length from a FASTQ (used as the post-trim read length denominator)."""
-    data = Path(path).read_bytes()
-    lines = data.split(b"\n")
-    accs, lens = [], []
-    for i in range(0, len(lines) - 1, 4):
-        head = lines[i]
-        if not head.startswith(b"@"):
-            continue
-        accs.append(head[1:].split(None, 1)[0].decode())
-        lens.append(len(lines[i + 1]))
-    return pl.DataFrame({"read_acc": accs, "fqlen": lens})
+# There is no coverage math here at all: `rule coverage` measured it on decode (coverage_lib holds
+# the formula) and this report renders that artifact. The fq_lengths helper and the covered-bases
+# sum used to live here; a second copy is exactly how a figure starts disagreeing with the filter.
 
 
 # ------------------------------------------------------------------------ discover + load
@@ -125,7 +128,8 @@ def discover():
             grp, rnd, idx = sample_group_round(S)
             samples.append(dict(name=S, dir=d, fc=fc, summ=summ,
                                 frags=d / f"{S}.fragments.parquet",
-                                fused_fq=d / f"{S}.fused_reads.fq",
+                                cov_pq=(Path(COV_BASE) / S / f"{S}.coverage.parquet"
+                                        if COV_BASE else None),
                                 umis=d / f"{S}.umis.parquet", log=d / f"{S}.ligateddna.log",
                                 line=grp, round=rnd, idx=idx, is_baseline=False))
     grank = {}                                    # group -> its first config index (order key)
@@ -147,7 +151,9 @@ def load_baseline():
         return None
     return dict(name=R0_STEM.name, dir=R0_STEM.parent, fc=fc, summ=summ,
                 frags=R0_STEM.parent / f"{R0_STEM.name}.fragments.parquet",
-                fused_fq=R0_STEM.parent / f"{R0_STEM.name}.fused_reads.fq",
+                # the baseline lives in the sibling covfilt_initial/ tree, so it is passed as a
+                # full path rather than derived from COV_BASE (cf. R0_STEM vs BASE)
+                cov_pq=(Path(R0_COV) if R0_COV else None),
                 umis=R0_STEM.parent / f"{R0_STEM.name}.umis.parquet",
                 log=R0_STEM.parent / f"{R0_STEM.name}.ligateddna.log",
                 line=baseline_group(), round=0, idx=-1, is_baseline=True)
@@ -210,20 +216,17 @@ def load(samples):
         else:
             edh[s["name"]] = {}
 
-        # coverage: bases covered by ANY expected fragment ÷ post-trim read length
-        # (fused_reads.fq). Distribution over reads, per sample; skipped if the fq is absent.
-        fq = s.get("fused_fq")
-        if s["frags"].exists() and fq is not None and Path(fq).exists():
-            covered = (pl.scan_parquet(s["frags"])
-                       .group_by("read_acc")
-                       .agg(covered=(pl.col("stop") - pl.col("start")).sum())
-                       .collect())
-            cj = (covered.join(fq_lengths(fq), on="read_acc", how="inner")
-                  .with_columns(cov=(pl.col("covered") / pl.col("fqlen")).clip(0.0, 1.0))
-                  .with_columns(bin=(pl.col("cov") * COVBINS).floor()
-                                .clip(0, COVBINS - 1).cast(pl.Int64)))
+        # coverage: rendered from `rule coverage`'s per-read record in the DECODE tree -- the
+        # same artifact the decode coverage filter judges reads with (see coverage_lib for the
+        # metric). Never recomputed here, and never measured on this report's own tree.
+        cpq = s.get("cov_pq")
+        cj = (pl.read_parquet(cpq).select("read_acc", "cov")
+              if cpq is not None and Path(cpq).exists() else None)
+        if cj is not None and cj.height:
+            cj = cj.with_columns(bin=(pl.col("cov") * COVBINS).floor()
+                                 .clip(0, COVBINS - 1).cast(pl.Int64))
             hist = cj.group_by("bin").agg(reads=pl.len())
-            n_cov = cj.height or 1
+            n_cov = cj.height
             cov[s["name"]] = {int(r["bin"]): r["reads"] / n_cov for r in hist.iter_rows(named=True)}
             cov[s["name"]]["_median"] = float(cj["cov"].median())
         else:
@@ -627,7 +630,10 @@ def fig_depth(d):
 
 
 def fig_coverage(d):
-    """Per-read coverage = expected-fragment bases ÷ post-trim read length; distribution per sample."""
+    """Per-read coverage = expected-fragment bases ÷ post-trim read length; distribution per sample.
+
+    This is the PRE-filter distribution when the decode coverage filter ran, so the cut line below
+    shows what it removed rather than an edge the data appears to stop at for no reason."""
     cols = sample_palette(d)
     have = [s for s in d["samples"] if d["cov"].get(s["name"])]
     if not have:
@@ -641,6 +647,11 @@ def fig_coverage(d):
             x=centers, y=ys, mode="lines", name=col_label(s), legendgroup=s["line"],
             line=dict(width=1.8, color=cols[nm], dash=sample_dash(s)),
             hovertemplate=f"{col_label(s)}<br>~%{{x:.0f}}% covered<br>%{{y:.1f}}% of reads<extra></extra>"))
+    if MIN_COVERAGE is not None:
+        fig.add_vline(x=100 * MIN_COVERAGE, line=dict(color=GREY, width=1.2, dash="dot"),
+                      annotation_text=f"filter: keep ≥ {100 * MIN_COVERAGE:.0f}%",
+                      annotation_position="top left",
+                      annotation_font=dict(size=11, color=GREY))
     # x starts at 60: under 0.2% of any sample's reads fall below that, and the clip gives the
     # informative 60-100 region ~2.5x the width.
     fig.update_xaxes(title="% of read length covered by expected fragments", range=[60, 100])
@@ -800,7 +811,13 @@ def main():
         "<dt>orientation</dt><dd>The master grid splits <b>forward</b> vs <b>reverse-complement</b> "
         "(<code>_rc</code>); every other panel sums the two.</dd>",
         "<dt>coverage</dt><dd>Σ(stop − start) over a read's expected fragments (anchors included) ÷ "
-        "the read's post-trim length from <code>fused_reads.fq</code>, clipped to [0, 1].</dd>",
+        "the read's post-trim length from <code>fused_reads.fq</code>, clipped to [0, 1]. The "
+        "decoder's fragment calls never overlap, so the plain sum is exact. Defined once in "
+        "<code>workflow/scripts/coverage_lib.py</code>, which is also what the decode coverage "
+        "filter judges reads with." +
+        (f" The distribution shown is PRE-filter; the dotted line marks the cut "
+         f"(<code>decode_filter.min_coverage = {MIN_COVERAGE}</code>), and reads left of it are "
+         f"absent from every downstream tree." if MIN_COVERAGE is not None else "") + "</dd>",
         "<dt>vocabulary</dt><dd>Feature set, backbone/anchor set and structural classes are derived "
         "from the decodes (<code>workflow/ligand_vocab.py</code>); nothing hard-coded.</dd>",
         "</dl>",

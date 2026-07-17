@@ -49,29 +49,86 @@ params:
   zmin:   104        # pychopper -z : min complete-molecule length for the construct
   ntrain: 50000      # train_hmm subsample size (0 = train on the full initial library)
 
-# ---- UMI processing (decode -> {dedup, umi} -> featurecount/reports) -----------------
-# `mode` selects the behaviour:
-#   filter  -- QC-filter garbage UMIs only (non-ACGT / low-complexity / bad UMI length);
-#              featurecount and reports run on the filtered `dedup/` tree.
-#   correct -- (default) filter, then CORRECT near-identical UMIs to their most-abundant ed<=1
-#              variant (starcode -d 1 -s) while KEEPING every read. This adds a separate `umi/`
-#              characterisation branch: per-molecule read counts, a per-group UMI x sample matrix,
-#              and a cross-sample UMI report. Fragment featurecount/reports are UNAFFECTED.
-#   dedup   -- filter, then COLLAPSE duplicates to one representative read per molecule; the
-#              collapsed tree feeds featurecount/reports (classic UMI dedup).
+# ---- decode coverage filter (decode -> the UMI spine) --------------------------------
+# A read's decoded coverage is the fraction of it that the decoder explained: bases covered by any
+# fragment call (ANCHORS INCLUDED -- they are real decoded bases) over the post-trim read length.
+# A read well below 1.0 is mostly sequence the decoder could not resolve, yet it still carries a
+# UMI and a fragment vector and so inflates every downstream count as if it were clean.
+# This is the ONLY drop between decode and the UMI spine, so every readout below shares ONE
+# consistent read set. The raw decode/ tree keeps the full picture and its own fragment report.
+# The raw `decode/` tree is never modified -- it stays the full record, and the cross-sample report
+# renders the PRE-filter coverage distribution from it.
+# With `enabled: false` the branches read `decode/` directly and no covfilt/ tree is built.
+decode_filter:
+  enabled: true
+  min_coverage: 0.9      # drop a read whose decoded coverage is < this
+
+# ---- UMI processing (covfilt -> umicorr -> [jackpot] -> umi) -------------------------
+# ONE spine, no modes. Every read is QC-classified from its fused UMI and the garbage is dropped;
+# anchor-only reads (no decoded ligand) are dropped; each survivor's UMI is corrected to its
+# most-abundant ed<=1 variant (starcode -d 1 -s) while KEEPING every read. `umi/` is the end of the
+# spine and is what every readout reads: featurecount, C_eff, fragvec.
+#
+# Nothing is ever COLLAPSED. The typical molecule here is seen about once, so there is almost
+# nothing to remove and collapsing would delete the high-count lineages that ARE the signal
+# (clarification.md). There is no `umi.mode`: a stale `dedup` or `filter` is REJECTED, not ignored.
 umi:
-  mode: correct          # filter | correct | dedup
   max_homopolymer: 8     # drop a UMI whose longest homopolymer run is >= this
   max_base_frac:   0.7   # drop a UMI where any single base's fraction is >= this
   # The UMI-length window (10..12 per UMI) is a constant in workflow/scripts/umi_filter_lib.py,
   # not a CLI flag, so it is deliberately not exposed here.
+
+# ---- jackpot filter (umicorr -> umi; the end of the UMI spine) -----------------------
+# A JACKPOT is a clonotype whose reads collapse onto very few UMIs: thousands of physical copies of
+# one construct whose UMI slot failed to randomise, so they pile onto ~one barcode. Ranked by raw
+# abundance it looks like a top hit; behaviourally it is an amplification/synthesis artefact.
+#
+# DETECTION IS NAIVE-LIBRARY ONLY, and the blacklist is applied to every round. That asymmetry is
+# forced: post-selection a genuinely enriched winner ALSO collapses its reads onto few clones, so
+# the ratio stops separating an artefact from a hit and detecting there would blacklist true
+# winners. Only in R0, where every construct starts at comparable abundance, is the signal clean.
+#
+# This runs BEFORE C_eff, deliberately: the complexity weighting is quadratic, so an artefact in the
+# top lineage corrupts it more than any biology can (clarification.md).
+#
+# `min_reads` is NOT a key here -- it reuses fragvec.min_reads, because the clone table the
+# blacklist is drawn from is restricted by that same floor.
+jackpot:
+  enabled: true
+  ratio_max: 10.0        # flag a clonotype whose n_reads/n_umis exceeds this. CITED: longread_umi
+                         #   BIN_CLUSTER_RATIO=10 (Karst et al. Nat Methods 2021). Workflow QC, not
+                         #   a biological claim.
+  match_ed1: false       # also drop reads within Levenshtein 1 of a blacklisted UMI (default: exact)
+  robust_k: 5.0          # REPORTED only: the median+k*MAD cut is shown for transparency and never
+                         #   acted on -- the action stays the cited ratio_max.
+
+# ---- fragment-vector quantification (decode -> fragvec) ------------------------------
+# The SECOND, independent analysis branch off `decode` (a sibling of the `umi` branch -- run either,
+# or both). A read's "fragment vector" is its sorted set of PAYLOAD fragment_ids (anchors excluded;
+# `_rc` kept distinct, since a reverse-ligated fragment is a different species). That vector IS the
+# library member, and it is where the statistical power lives: ~4-10 reads per vector vs ~1.0 reads
+# per UMI. Per sample and vector this counts TWO axes (the CRISPR-UMI convention):
+#   n_reads  -- abundance
+#   n_umis   -- incidence: how many INDEPENDENT clones carry the vector (the jackpot control)
+# A vector enriched via many clones is reproducible selection; via one clone it is a single lineage.
+fragvec:
+  enabled: true
+  min_reads: 10          # counts below this are FLAGGED as noise, not dropped (single-digit counts
+                         #   do not reproduce between replicates -- Kuai et al. 2018)
+  # The `vector` column ALWAYS records the read's FULL decoded fragment content, anchors included,
+  # exactly as the tool emitted it -- that is the point of the file. Nothing is silently removed.
+  # Exclusions happen only inside specific analyses, and each is DECLARED in the summary:
+  #   * anchor-only reads (no payload fragment) are dropped   -> summary: dropped_no_payload
+  #   * sub-vector marginals are computed on payload only     -> summary: marginals_exclude_anchors
+  # (On this data every payload-bearing read carries the identical anchor pattern, so anchors are a
+  #  constant prefix: the distinct-vector count is the same with or without them.)
 
 # ---- per-rule thread counts (Snakemake -j caps total concurrency) -------------------
 threads:
   clean:     18
   pychopper: 18
   decode:    8       # -> RAYON_NUM_THREADS for the Rust decoder
-  dedup:     8       # recorded in provenance only; starcode is pinned to -t 1 (reproducibility)
+  umi:       8       # UMI filter+correct: Snakemake scheduling + polars; also in provenance
 
 # ---- reports ------------------------------------------------------------------------
 report:

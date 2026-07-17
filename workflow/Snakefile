@@ -1,14 +1,22 @@
 # ONT ligated-DNA selection-screen workflow.
 #
-#   raw fastqs -> nanocomp                 (cross-sample read QC; parallel branch, gates nothing)
-#   clean -> train_hmm -> pychopper -> decode -> dedup -> featurecount -> {report_sample, report_cross}
-#                                                    └─► umi_correct ─┬─► umi_matrix
-#                                                                     └─► umi_complexity ─► report_umi_cross
+#   raw fastqs -> nanocomp        (cross-sample read QC; parallel branch, gates nothing)
+#   clean -> train_hmm -> pychopper -> decode ─► featurecount ─► fragment report   [RAW]
+#                                        └─► coverage ─► covfilt ─► umi_correct ─► umicorr
+#                                              └─► jackpot detect (R0) ─► blacklist + jackpot reports
+#                                                    └─► jackpot apply ─► umi ─┬─► featurecount ─► fragment report [CLEAN]
+#                                                                              ├─► umi_matrix, umi_complexity ─► umi report
+#                                                                              └─► fragvec ─► fragvec report
 #
-# `umi.mode` (default `correct`) drives the UMI stage. The `dedup/` tree always QC-filters and feeds
-# featurecount/reports (it COLLAPSES to molecules only in mode `dedup`). Mode `correct` additionally
-# runs the independent `umi/` branch: ed<=1 UMI correction, a per-group corrected-UMI x sample
-# matrix, and a cross-sample UMI report — none of which change the fragment counts.
+# ONE spine, and every readout hangs off its clean end, so nothing disagrees about which reads exist.
+# Two read-level cuts, each measured where its signal is identifiable:
+#   `decode_filter.min_coverage` drops reads the decoder barely explained (a decode-step property).
+#   `jackpot` drops the artefact barcodes the NAIVE R0 library exposes (identifiable only there).
+# Nothing is ever COLLAPSED -- the typical molecule is seen about once and high-count lineages are
+# the signal, not noise (clarification.md:667).
+#
+# TWO fragment reports, one either side of the UMI processing: the same rule serves both trees, and
+# their difference IS the funnel (coverage-dropped, garbage-UMI, anchor-only, jackpot).
 #
 # Run from the repo root (where pixi.toml lives):
 #   snakemake -n                 # dry-run: inspect the DAG
@@ -25,24 +33,35 @@ rule all:
     input:
         # cross-sample read QC on the raw fastqs (NanoComp — one combined report)
         f"{OUTDIR}/qc/nanocomp/bysample_NanoComp-report.html",
-        # one interactive report per sample (experimental + the initial library), built from the
-        # processed dedup/ tree when the UMI stage runs (filter and/or collapse), else raw decode
+        # one interactive report per sample (experimental + the initial library), on the clean tree
         [f"{report_stem(s)}.featurecount_report.html" for s in SAMPLES],
-        # the cross-sample comparison report, over that same tree
+        # TWO cross-sample fragment reports, bracketing the UMI processing: the RAW decode tree and
+        # the CLEAN one. Same rule, different {crossbase}. Their difference is the read funnel.
+        f"{OUTDIR}/decode/cross_sample_featurecount_report.html",
         f"{OUTDIR}/{CROSSBASE}/cross_sample_featurecount_report.html",
         # summaries (parity with the legacy scripts)
         f"{OUTDIR}/clean/clean_summary.tsv",
         f"{OUTDIR}/preprocess/batch_summary.tsv",
-        *([f"{OUTDIR}/dedup/umi_dedup_summary.tsv"] if UMI_STAGE_ON else []),
-        # UMI characterisation branch (mode `correct`): per-group corrected-UMI x sample matrices,
-        # the depth-robust effective-complexity tables, and the cross-sample UMI report. Independent
-        # of the fragment reports above. The two complexity TSVs are listed even though the report
-        # pulls them in transitively — they are outputs in their own right and survive if the report
-        # is ever switched off.
-        *([f"{OUTDIR}/umi/{g}.umi_x_sample.mtx" for g in GROUPS] if UMI_CORRECT_ON else []),
-        *([f"{OUTDIR}/umi/umi_complexity.tsv",
-           f"{OUTDIR}/umi/umi_collapse.tsv"] if UMI_CORRECT_ON else []),
-        *([f"{OUTDIR}/umi/umi_report_cross.html"] if UMI_CORRECT_ON else []),
+        # decode coverage filter: how many reads each sample lost below decode_filter.min_coverage.
+        # The covfilt/ tree itself is pulled in transitively by every branch below; this is the
+        # cross-sample QC row, an output in its own right.
+        *([f"{OUTDIR}/covfilt/coverage_summary.tsv"] if DECODE_FILTER_ON else []),
+        # the jackpot audit: which clonotypes were flagged, why, and what the blacklist removed.
+        # A first-class output of the umi step, not a re-render of the reports below.
+        *([f"{OUTDIR}/jackpot/{INITIAL}.umi_jackpot_report.html",
+           f"{OUTDIR}/jackpot/{INITIAL}.fragvec_jackpot_report.html"] if JACKPOT_ON else []),
+        # UMI characterisation: per-group corrected-UMI x sample matrices, the depth-robust
+        # effective-complexity tables, and the cross-sample UMI report — all over the CLEAN tree.
+        # The two complexity TSVs are listed even though the report pulls them in transitively —
+        # they are outputs in their own right and survive if the report is ever switched off.
+        [f"{OUTDIR}/umi/{g}.umi_x_sample.mtx" for g in GROUPS],
+        f"{OUTDIR}/umi/umi_complexity.tsv",
+        f"{OUTDIR}/umi/umi_collapse.tsv",
+        f"{OUTDIR}/umi/umi_report_cross.html",
+        # fragment-vector branch (the two-axis readout): per-group vector x sample matrices + report.
+        # A sibling of the umi/ branch — independently switchable; run either or both.
+        *([f"{OUTDIR}/fragvec/{g}.fragvec_x_sample.reads.mtx" for g in GROUPS] if FRAGVEC_ON else []),
+        *([f"{OUTDIR}/fragvec/fragvec_report_cross.html"] if FRAGVEC_ON else []),
 
 
 include: "rules/qc.smk"
@@ -52,7 +71,9 @@ include: "rules/clean.smk"
 include: "rules/hmm.smk"
 include: "rules/preprocess.smk"
 include: "rules/decode.smk"
-include: "rules/dedup.smk"
+include: "rules/coverage.smk"
 include: "rules/umi.smk"
+include: "rules/jackpot.smk"
+include: "rules/fragvec.smk"
 include: "rules/featurecounts.smk"
 include: "rules/reports.smk"

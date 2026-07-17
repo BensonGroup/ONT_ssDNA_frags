@@ -70,12 +70,22 @@ def cross_inputs(wildcards):
     if config["report"]["r0_baseline"]:
         st = f"{OUTDIR}/{base}_initial/{INITIAL}/{INITIAL}"
         files += [st + p for p in parts]
+    # The coverage panel RENDERS `rule coverage`'s per-read record, so it is a declared input, not
+    # just transitively available: rebuilding the report against a stale coverage.parquet would
+    # publish a distribution that no longer matches the reads it describes.
+    #
+    # UNCONDITIONAL, and from stem() -- the raw DECODE tree -- regardless of the coverage filter.
+    # Coverage is a decode-step property; measuring it on `base` (the clean umi/ tree, downstream of
+    # the coverage filter, the UMI filter AND the jackpot filter) would describe an already-cut set.
+    files += [f"{stem(s)}.coverage.parquet" for s in NONINITIAL]
+    if config["report"]["r0_baseline"]:
+        files.append(f"{stem(INITIAL)}.coverage.parquet")
     return files
 
 
 # Cross-sample comparison report. L2F_R0_STEM="" disables the R0 baseline in the script;
 # L2F_SAMPLES points the script at the config-derived grouping metadata. Parameterized by
-# {crossbase} so the same rule serves the raw decode tree and the deduplicated one; `rule all`
+# {crossbase} so the same rule serves the raw decode tree and the UMI-filtered one; `rule all`
 # requests CROSSBASE (see common.smk).
 rule report_cross:
     input:
@@ -88,9 +98,19 @@ rule report_cross:
         base=lambda wc: os.path.abspath(f"{OUTDIR}/{wc.crossbase}"),
         r0=lambda wc: (os.path.abspath(f"{OUTDIR}/{wc.crossbase}_initial/{INITIAL}/{INITIAL}")
                        if config["report"]["r0_baseline"] else ""),
+        # The coverage panel's source: the RAW decode tree's per-read record, always. It is the only
+        # honest place to measure a decode-step property -- {crossbase} may be the clean umi/ tree,
+        # which sits downstream of every filter. L2F_MIN_COVERAGE only draws the cut line, and is "" when
+        # the coverage filter is off (then nothing was cut, so there is no line to draw).
+        cov_base=os.path.abspath(f"{OUTDIR}/decode"),
+        r0_cov=(os.path.abspath(f"{stem(INITIAL)}.coverage.parquet")
+                if config["report"]["r0_baseline"] else ""),
+        mincov=(DECODE_MIN_COVERAGE if DECODE_FILTER_ON else ""),
         script=str(SCRIPTS / "build_featurecount_report_cross.py"),
     shell:
         r"""
         L2F_BASE="{params.base}" L2F_R0_STEM="{params.r0}" L2F_SAMPLES="{input.meta}" \
+        L2F_COV_BASE="{params.cov_base}" L2F_R0_COV="{params.r0_cov}" \
+        L2F_MIN_COVERAGE="{params.mincov}" \
             pixi run -e default python "{params.script}"
         """

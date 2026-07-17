@@ -1,46 +1,61 @@
-# UMI characterisation branch (mode `correct`): QC-filter + ed<=1 UMI correction, a per-group
-# corrected-UMI x sample abundance matrix, and a cross-sample UMI report. This branch is a SIBLING
-# of the decode/dedup trees and never feeds featurecount -- the fragment reports are unaffected.
+# The UMI spine: QC-filter + ed<=1 correction (here), then the jackpot filter (rules/jackpot.smk).
 #
-#   decode ─► umi_correct (per sample, umi/<s>/) ─► umi_matrix (per group) ─► report_umi_cross
+#   covfilt ─► umi_correct (umicorr/<s>/) ─► jackpot ─► umi/<s>/ ─┬─► umi_matrix ─► report_umi_cross
+#                                                                  ├─► umi_complexity (C_eff)
+#                                                                  ├─► featurecount (clean fragment report)
+#                                                                  └─► fragvec
 #
-# `umi_correct` reads the raw decode artifacts and does its own QC filter (reusing umi_filter_lib),
-# so it is independent of `rule dedup`. It keeps every read that passes the filter and relabels its
-# fused UMI to the abundant ed<=1 centroid (starcode -d 1 -s). Enabled only when UMI_CORRECT_ON.
+# This is the ONLY UMI stage. It classifies every read from its fused UMI (umi_filter_lib -- the
+# dependency-free, unit-tested classifier), drops the garbage, drops anchor-only reads, and relabels
+# each survivor's UMI to its abundant ed<=1 centroid (starcode -d 1 -s). NOTHING is collapsed.
+#
+# Its output tree `umicorr/` is NOT a readout: it still carries the artefact barcodes the jackpot
+# stage removes, so a C_eff computed on it would be corrupted (clarification.md:399-403). Only
+# jackpot_detect and jackpot_apply read it.
 
 
-def _umi_src_stem(wc):
-    """The decode stem feeding a umi/ stem, with the group<->tree guard (mirrors _dedup_src_stem)."""
-    want = umibase(wc.sample)                        # group -> umi | umi_initial
-    if wc.umibase != want:
+def _umicorr_src_stem(wc):
+    """The decode stem feeding a umicorr/ stem, with the group<->tree guard.
+
+    decode_src_stem() resolves to covfilt/ when the coverage filter is on, so the UMI spine starts
+    from the same read set the raw fragment report's funnel accounts for."""
+    want = umicorrbase(wc.sample)                    # group -> umicorr | umicorr_initial
+    if wc.umicorrbase != want:
         raise ValueError(
             f"sample {wc.sample!r} (group {SAMPLE[wc.sample]['group']!r}) belongs in "
-            f"{want}/, not {wc.umibase}/")
-    src = "decode_initial" if wc.umibase == "umi_initial" else "decode"
-    return f"{OUTDIR}/{src}/{wc.sample}/{wc.sample}"
+            f"{want}/, not {wc.umicorrbase}/")
+    return decode_src_stem(wc.sample)
 
 
 rule umi_correct:
     input:
-        fused=lambda wc: f"{_umi_src_stem(wc)}.fused.parquet",
-        umis=lambda wc: f"{_umi_src_stem(wc)}.umis.parquet",
+        fused=lambda wc: f"{_umicorr_src_stem(wc)}.fused.parquet",
+        umis=lambda wc: f"{_umicorr_src_stem(wc)}.umis.parquet",
         # fragments drive the payload filter: anchor-only reads (no decoded ligand) are dropped
-        frags=lambda wc: f"{_umi_src_stem(wc)}.fragments.parquet",
+        frags=lambda wc: f"{_umicorr_src_stem(wc)}.fragments.parquet",
+        log=lambda wc: f"{_umicorr_src_stem(wc)}.ligateddna.log",
     output:
-        fused=f"{OUTDIR}/{{umibase}}/{{sample}}/{{sample}}.fused.parquet",
+        fused=f"{OUTDIR}/{{umicorrbase}}/{{sample}}/{{sample}}.fused.parquet",
         # decode fragment calls carried through UNCHANGED (filtered to kept reads): correction never
         # touches the fragment level, and start/stop are needed for the positional fragment vector
-        frags=f"{OUTDIR}/{{umibase}}/{{sample}}/{{sample}}.fragments.parquet",
-        species=f"{OUTDIR}/{{umibase}}/{{sample}}/{{sample}}.umi_species.tsv",
-        summary=f"{OUTDIR}/{{umibase}}/{{sample}}/{{sample}}.umi_summary.tsv",
+        frags=f"{OUTDIR}/{{umicorrbase}}/{{sample}}/{{sample}}.fragments.parquet",
+        # the anchor VOCABULARY and the decode log: featurecount / report_sample find both by stem,
+        # so a decode-shaped tree must carry them for the clean fragment report to build here
+        umis=f"{OUTDIR}/{{umicorrbase}}/{{sample}}/{{sample}}.umis.parquet",
+        log=f"{OUTDIR}/{{umicorrbase}}/{{sample}}/{{sample}}.ligateddna.log",
+        species=f"{OUTDIR}/{{umicorrbase}}/{{sample}}/{{sample}}.umi_species.tsv",
+        summary=f"{OUTDIR}/{{umicorrbase}}/{{sample}}/{{sample}}.umi_summary.tsv",
+        # one row per INPUT read: a dropped read is still here, carrying the class that explains why.
+        # Nothing else records that -- it moved here when the separate UMI-filter stage was folded in.
+        audit=f"{OUTDIR}/{{umicorrbase}}/{{sample}}/{{sample}}.umi_audit.parquet",
     wildcard_constraints:
-        umibase="umi|umi_initial",
-    threads: DEDUP_THREADS
+        umicorrbase="umicorr|umicorr_initial",
+    threads: UMI_THREADS
     params:
-        src_stem=lambda wc: os.path.abspath(_umi_src_stem(wc)),
-        dir=lambda wc: os.path.abspath(f"{OUTDIR}/{wc.umibase}/{wc.sample}"),
-        maxhp=DEDUP_MAX_HOMOPOLYMER,
-        maxbf=DEDUP_MAX_BASE_FRAC,
+        src_stem=lambda wc: os.path.abspath(_umicorr_src_stem(wc)),
+        dir=lambda wc: os.path.abspath(f"{OUTDIR}/{wc.umicorrbase}/{wc.sample}"),
+        maxhp=UMI_MAX_HOMOPOLYMER,
+        maxbf=UMI_MAX_BASE_FRAC,
         script=str(SCRIPTS / "umi_correct.py"),
     shell:
         r"""
@@ -139,13 +154,16 @@ rule umi_complexity:
 # The complexity TSVs are declared inputs, not just transitively available: the report RENDERS them,
 # so rebuilding it against a stale table would silently publish stale numbers.
 def umi_report_inputs(wildcards):
+    # Fragments for the purity QC come from decode_src_stem(), not stem(): a read the coverage
+    # filter dropped must not contribute a ligand signature to a UMI group it is no longer part of.
     ins = []
     for s in NONINITIAL:
         ins += [f"{umi_stem(s)}.umi_species.tsv", f"{umi_stem(s)}.umi_summary.tsv",
-                f"{umi_stem(s)}.fused.parquet", f"{stem(s)}.fragments.parquet"]
+                f"{umi_stem(s)}.fused.parquet", f"{decode_src_stem(s)}.fragments.parquet"]
     if config["report"]["r0_baseline"]:
         ins += [f"{umi_stem(INITIAL)}.umi_species.tsv", f"{umi_stem(INITIAL)}.umi_summary.tsv",
-                f"{umi_stem(INITIAL)}.fused.parquet", f"{stem(INITIAL)}.fragments.parquet"]
+                f"{umi_stem(INITIAL)}.fused.parquet",
+                f"{decode_src_stem(INITIAL)}.fragments.parquet"]
     return ins
 
 
@@ -160,8 +178,8 @@ rule report_umi_cross:
     params:
         base=os.path.abspath(f"{OUTDIR}/umi"),
         r0_stem=(os.path.abspath(umi_stem(INITIAL)) if config["report"]["r0_baseline"] else ""),
-        decode_base=os.path.abspath(f"{OUTDIR}/decode"),
-        r0_frags=(os.path.abspath(f"{stem(INITIAL)}.fragments.parquet")
+        decode_base=os.path.abspath(f"{OUTDIR}/{DECODE_SRC_BASE}"),
+        r0_frags=(os.path.abspath(f"{decode_src_stem(INITIAL)}.fragments.parquet")
                   if config["report"]["r0_baseline"] else ""),
         script=str(SCRIPTS / "build_umi_report_cross.py"),
     shell:

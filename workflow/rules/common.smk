@@ -320,14 +320,18 @@ def _cfg_choice(v, default, *, key, choices):
 wildcard_constraints:
     sample="|".join(re.escape(s) for s in SAMPLES),
     # featurecount / featurecount_check / report_sample serve BOTH the raw decode trees and the
-    # deduplicated ones, so `decbase` spans all four. The producers must NOT: `rule decode` pins
-    # itself to decode|decode_initial and `rule dedup` to dedup|dedup_initial, both with per-rule
-    # constraints. Otherwise decode would also match a dedup/ path -> AmbiguousRuleException.
-    decbase="decode|decode_initial|dedup|dedup_initial",
-    dedbase="dedup|dedup_initial",                   # the tree `rule dedup` writes into
-    umibase="umi|umi_initial",                       # the tree `rule umi_correct` writes into
+    # clean umi ones, so `decbase` spans all four -- that is what gives us TWO fragment reports,
+    # one either side of the UMI processing. The producers must NOT: `rule decode` and `rule
+    # coverage` pin themselves to decode|decode_initial and `rule jackpot_apply` to umi|umi_initial,
+    # all with per-rule constraints. Otherwise decode would also match a umi/ path ->
+    # AmbiguousRuleException.
+    decbase="decode|decode_initial|umi|umi_initial|umicorr|umicorr_initial",
+    covbase="covfilt|covfilt_initial",               # the tree `rule covfilt` writes into
+    umicorrbase="umicorr|umicorr_initial",           # the tree `rule umi_correct` writes into
+    umibase="umi|umi_initial",                       # the tree `rule jackpot_apply` writes into
     fvbase="fragvec|fragvec_initial",                # the tree `rule fragvec` writes into
-    crossbase="decode|dedup",                        # which tree report_cross is built over
+    crossbase="decode|umi|umicorr",                  # which tree report_cross is built over
+                                                     #   (umicorr only when jackpot is off)
     k="|".join(str(i) for i in range(N_GENOMES)),   # depletion stage index
 
 
@@ -348,57 +352,134 @@ def stem(s):
     return f"{OUTDIR}/{decbase(s)}/{s}/{s}"
 
 
-# ---- UMI stage: QC-filter (always) + optional ed<=1 correction / collapse ------------
-# `umi.mode` selects the behaviour (default `correct`); read defensively (a project config may lack
-# the `umi:` key). The processed `dedup/` tree (filtered, or collapsed in `dedup` mode) ALWAYS feeds
-# featurecount/reports -- correction never changes fragment counts. Thresholds fall back to the
-# umi_filter_lib constants rather than raising KeyError.
+# ---- decode coverage filter (`covfilt/` tree; see rules/covfilt.smk) -----------------------------
+# The ONLY read-level drop between decode and the UMI spine, so every readout off its clean end
+# inherits ONE consistent read set. Read defensively and coerce: a `--config` override arrives as
+# a string (see the parse_config note above), and an unvalidated float would reach the shell.
+DECODE_FILTER = config.get("decode_filter", {}) or {}
+DECODE_FILTER_ON = _cfg_bool(DECODE_FILTER.get("enabled"), True, key="decode_filter.enabled")
+DECODE_MIN_COVERAGE = _cfg_float(DECODE_FILTER.get("min_coverage"), 0.9,
+                                 key="decode_filter.min_coverage", lo=0.0, hi=1.0)
+
+
+def covbase(s):
+    """Which coverage-filtered tree a sample lands in (mirrors decbase(): the initial library is
+    kept separate so no cross-report glob ever sees it as both a column and the baseline)."""
+    return "covfilt_initial" if SAMPLE[s]["group"] == BASELINE_GROUP else "covfilt"
+
+
+def cov_stem(s):
+    """Coverage-filtered output stem, e.g. results/covfilt/A549_R1/A549_R1."""
+    return f"{OUTDIR}/{covbase(s)}/{s}/{s}"
+
+
+def decode_src_stem(s):
+    """The READ-SET source for every analysis branch: the coverage-filtered tree when the filter is
+    on, else the raw decode tree.
+
+    Every branch resolves its decode input through THIS -- dedup, umi_correct and fragvec each used
+    to hardcode `"decode_initial" if ... else "decode"`, so inserting a stage meant editing three
+    places and silently skipping any one of them left that branch on the unfiltered reads."""
+    return cov_stem(s) if DECODE_FILTER_ON else stem(s)
+
+
+# The NON-INITIAL decode-data tree root, for the reports that take a base directory and glob `*/`
+# rather than a per-sample stem. The initial library always resolves through cov_stem()/stem().
+DECODE_SRC_BASE = "covfilt" if DECODE_FILTER_ON else "decode"
+
+
+# ---- UMI stage: QC-filter + ed<=1 correction (umicorr/), then jackpot clean (umi/) ---
+# One spine, no modes. Every read is QC-classified from its fused UMI and garbage is dropped; the
+# survivors' UMIs are corrected to their abundant ed<=1 centroid; the jackpot filter then drops the
+# artefact barcodes the R0 library exposes. `umi/` is the END of that spine and is what every
+# readout reads -- featurecount, C_eff, fragvec.
+#
+# There is no `umi.mode`. It used to pick between `filter` (stop after the QC filter) and `correct`,
+# because a `umifilt/` tree fed featurecount. featurecount now reads decode/ (raw) and umi/ (clean),
+# so a filter-only tree has no consumer and the mode selected nothing. `dedup` is likewise gone:
+# this data must not be UMI-deduplicated (clarification.md:667). A stale key is REJECTED, not
+# ignored -- a config asking for a behaviour that no longer exists is a mistake, not a preference.
+# Thresholds fall back to the umi_filter_lib constants rather than raising KeyError.
 UMI = config.get("umi", {}) or {}
-UMI_MODE = _cfg_choice(UMI.get("mode"), "correct", key="umi.mode",
-                       choices=("filter", "correct", "dedup"))
-DEDUP_ON = UMI_MODE == "dedup"            # collapse to one representative read per molecule
-UMI_CORRECT_ON = UMI_MODE == "correct"    # run the separate umi/ correction + characterisation branch
-UMI_STAGE_ON = True                       # the dedup/ tree (filter or collapse) always feeds featurecount
-DEDUP_MAX_HOMOPOLYMER = _cfg_int(UMI.get("max_homopolymer"), 8, key="umi.max_homopolymer", lo=1)
-DEDUP_MAX_BASE_FRAC = _cfg_float(UMI.get("max_base_frac"), 0.7,
-                                 key="umi.max_base_frac", lo=0.0, hi=1.0)
-DEDUP_THREADS = _cfg_int(config["threads"].get("dedup"), 8, key="threads.dedup", lo=1)
+if "mode" in UMI:
+    raise ValueError(
+        "config.umi.mode: removed. The UMI stage is now one spine -- QC-filter, then ed<=1 "
+        "correct, then jackpot-clean -- and `umi/` is what every readout reads. `filter` selected a "
+        "tree nothing consumes now that featurecount reads decode/ and umi/; `dedup` never applied "
+        "to this data (clarification.md). Delete the key.")
+UMI_MAX_HOMOPOLYMER = _cfg_int(UMI.get("max_homopolymer"), 8, key="umi.max_homopolymer", lo=1)
+UMI_MAX_BASE_FRAC = _cfg_float(UMI.get("max_base_frac"), 0.7,
+                               key="umi.max_base_frac", lo=0.0, hi=1.0)
+# `threads.dedup`/`threads.umifilt` were renamed with the stage. `.get()` would silently ignore a
+# stale key and fall back to the default, so reject them by name.
+for _stale in ("dedup", "umifilt"):
+    if _stale in (config.get("threads", {}) or {}):
+        raise ValueError(
+            f"config.threads.{_stale}: renamed to `threads.umi` (the UMI stage is now one rule: "
+            f"filter + correct). Rename the key -- leaving it would silently apply the default.")
+UMI_THREADS = _cfg_int(config["threads"].get("umi"), 8, key="threads.umi", lo=1)
 
 
-def dedbase(s):
-    """Which filtered/collapsed tree a sample lands in. Mirrors decbase(): the initial library is
-    kept in its own tree so report_cross's `<crossbase>/*/` glob never sees it as both a column and
-    the R0 baseline."""
-    return "dedup_initial" if SAMPLE[s]["group"] == BASELINE_GROUP else "dedup"
+# ---- jackpot filter (`umicorr/` -> `umi/`; see rules/jackpot.smk) --------------------------------
+# DETECT on the R0 library, APPLY everywhere. A jackpot is a clonotype whose reads collapse onto very
+# few UMIs -- an amplification/synthesis artefact that ranks like a top hit. Detection is naive-library
+# ONLY: post-selection a genuinely enriched winner ALSO collapses reads onto few UMIs, so detecting
+# there would blacklist true winners. That is why the shape is fan-in/fan-out rather than per-sample.
+#
+# `min_reads` is NOT a key here: it reuses fragvec.min_reads deliberately. The clone table the
+# blacklist is built from is restricted to signal-carrying vectors by that same floor, so a second,
+# lower floor would flag clonotypes whose UMIs are absent from the table and drop them silently.
+JACKPOT = config.get("jackpot", {}) or {}
+JACKPOT_ON = _cfg_bool(JACKPOT.get("enabled"), True, key="jackpot.enabled")
+JACKPOT_RATIO_MAX = _cfg_float(JACKPOT.get("ratio_max"), 10.0, key="jackpot.ratio_max", lo=1.0)
+JACKPOT_ROBUST_K = _cfg_float(JACKPOT.get("robust_k"), 5.0, key="jackpot.robust_k", lo=0.0)
+JACKPOT_MATCH_ED1 = _cfg_bool(JACKPOT.get("match_ed1"), False, key="jackpot.match_ed1")
+
+# The blacklist: ONE wildcard-free artifact derived from the R0 library, listed as a constant input
+# by every per-sample apply job. Exactly the train_hmm shape (HMM above).
+JACKPOT_BL = f"{OUTDIR}/jackpot/{INITIAL}.umi_blacklist.tsv"
+
+# ---- the corrected tree (`umicorr/`): umi_correct's output, the jackpot stage's input -----------
+# NOT a readout. Nothing but jackpot_detect and jackpot_apply may read it: it still carries the
+# artefact barcodes, so a C_eff computed here would be corrupted (clarification.md:399-403 -- the
+# weighting is quadratic, so an artifact in the top lineage corrupts S more than any biology can).
+def umicorrbase(s):
+    return "umicorr_initial" if SAMPLE[s]["group"] == BASELINE_GROUP else "umicorr"
 
 
-def dedup_stem(s):
-    """Filtered/collapsed output stem for a sample, e.g. results/dedup/A549_R1/A549_R1."""
-    return f"{OUTDIR}/{dedbase(s)}/{s}/{s}"
+def umicorr_stem(s):
+    """UMI-correction output stem, e.g. results/umicorr/A549_R1/A549_R1."""
+    return f"{OUTDIR}/{umicorrbase(s)}/{s}/{s}"
 
 
-def report_stem(s):
-    """The stem whose featurecounts / per-sample report `rule all` builds: the processed dedup/
-    tree (the UMI stage always filters), so correction never changes fragment counts."""
-    return dedup_stem(s) if UMI_STAGE_ON else stem(s)
-
-
-# Base tree for the cross-sample FRAGMENT report (report_cross is parameterized by {crossbase}); its
-# R0 baseline is derived as f"{CROSSBASE}_initial", so the two move in lockstep.
-CROSSBASE = "dedup" if UMI_STAGE_ON else "decode"
-
-
-# ---- UMI correction branch (`umi/` tree, sibling of decode/dedup; see rules/umi.smk) -------------
-# Produced only when UMI_CORRECT_ON. Keeps every kept read but relabels its fused UMI to the abundant
-# ed<=1 centroid and records the per-molecule read count. The initial library is kept in its own
-# `umi_initial/` tree so the cross-sample glob never double-counts it.
+# ---- the clean tree (`umi/`): the END of the UMI spine, and every readout's source --------------
+# umi_correct -> umicorr/ -> jackpot_apply -> umi/. The initial library is kept in its own
+# `umi_initial/` tree so the cross-sample globs never see it as both a column and the R0 baseline.
+# `umi/` keeps the name deliberately: umi_matrix, umi_complexity, report_umi_cross and fragvec all
+# resolve through umi_stem(), so they read cleaned data without knowing the jackpot stage exists.
 def umibase(s):
     return "umi_initial" if SAMPLE[s]["group"] == BASELINE_GROUP else "umi"
 
 
 def umi_stem(s):
-    """UMI-correction output stem, e.g. results/umi/A549_R1/A549_R1."""
-    return f"{OUTDIR}/{umibase(s)}/{s}/{s}"
+    """The CLEAN UMI stem -- corrected + jackpot-filtered, e.g. results/umi/A549_R1/A549_R1.
+
+    With the jackpot filter off there is nothing to filter WITH, so the spine ends at umicorr/ and
+    every readout resolves there instead. Same shape as decode_src_stem()'s covfilt/decode fallback:
+    the readouts never learn whether the stage ran."""
+    return f"{OUTDIR}/{umibase(s)}/{s}/{s}" if JACKPOT_ON else umicorr_stem(s)
+
+
+def report_stem(s):
+    """The stem whose featurecounts / per-sample report `rule all` builds: the clean umi/ tree."""
+    return umi_stem(s)
+
+
+# Base tree for the CLEAN cross-sample fragment report (report_cross is parameterized by
+# {crossbase}); its R0 baseline is derived as f"{CROSSBASE}_initial", so the two move in lockstep.
+# The RAW fragment report is built over `decode` by the same rule -- two reports bracketing the
+# processing, and their difference is the funnel. Must stay in step with the `crossbase` constraint.
+CROSSBASE = "umi" if JACKPOT_ON else "umicorr"
 
 
 # Every group except the baseline gets a matrix and a report line -- `empty` INCLUDED. It is a PEER:
@@ -421,21 +502,24 @@ def group_samples(g):
     return [INITIAL] + members
 
 
-# ---- fragment-vector branch (`fragvec/` tree; see rules/fragvec.smk) -----------------------------
-# The second, INDEPENDENT analysis branch off decode (sibling of the umi/ branch -- run either or both).
-# A read's fragment vector (its sorted PAYLOAD fragment_ids) is the library member, and unlike the UMI
-# it carries real depth (~4-10 reads/vector vs ~1.0 reads/UMI). Counts two axes per vector: n_reads
-# (abundance) and n_umis (incidence = independent clones), so a jackpot (many reads, one clone) is
-# distinguishable from reproducible selection (many reads, many clones).
+# ---- fragment-vector readout (`fragvec/` tree; see rules/fragvec.smk) ---------------------------
+# A readout off the CLEAN end of the UMI spine (umi/), alongside featurecount and C_eff. A read's
+# fragment vector is the library member, and unlike the UMI it carries real depth (~4-10 reads/vector
+# vs ~1.0 reads/UMI). Counts two axes per vector: n_reads (abundance) and n_umis (incidence =
+# independent clones), so a jackpot (many reads, one clone) is distinguishable from reproducible
+# selection (many reads, many clones) -- the same signal the jackpot filter cuts on upstream.
 FRAGVEC = config.get("fragvec", {}) or {}
 FRAGVEC_ON = _cfg_bool(FRAGVEC.get("enabled"), True, key="fragvec.enabled")
-FRAGVEC_UMI_SOURCE = _cfg_choice(FRAGVEC.get("umi_source"), "corrected", key="fragvec.umi_source",
-                                 choices=("corrected", "raw"))
 FRAGVEC_MIN_READS = _cfg_int(FRAGVEC.get("min_reads"), 10, key="fragvec.min_reads", lo=1)
-if FRAGVEC_ON and FRAGVEC_UMI_SOURCE == "corrected" and not UMI_CORRECT_ON:
+# `fragvec.umi_source` is removed. It picked between the corrected UMI and the raw one, so that
+# fragvec could stand alone without the umi branch. There is no standing alone now: the umi spine is
+# mandatory, and `raw` would read a tree upstream of the jackpot filter -- i.e. silently quantify
+# clonotypes the pipeline just declared artefacts, using a clone label the blacklist cannot match.
+if "umi_source" in FRAGVEC:
     raise ValueError(
-        "config.fragvec.umi_source: 'corrected' needs the UMI correction branch "
-        "(set umi.mode: correct, or use fragvec.umi_source: raw)")
+        "config.fragvec.umi_source: removed. fragvec always reads the clean `umi/` tree "
+        "(corrected UMIs, jackpot-filtered); `raw` would bypass the jackpot filter and label clones "
+        "with an uncorrected UMI the blacklist cannot match. Delete the key.")
 
 
 def fvbase(s):
@@ -445,6 +529,8 @@ def fvbase(s):
 def fragvec_stem(s):
     """Fragment-vector output stem, e.g. results/fragvec/A549_R1/A549_R1."""
     return f"{OUTDIR}/{fvbase(s)}/{s}/{s}"
+
+
 
 
 # ---- depletion-chain inputs --------------------------------------------------------

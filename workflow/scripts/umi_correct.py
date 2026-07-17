@@ -5,7 +5,7 @@ Given one decoded sample (``<STEM>.fused.parquet`` + ``.umis.parquet``), this:
 
   STEP 1  QC-filters every read from its fused UMI sequence and its two UMI lengths, dropping
           garbage UMIs (non-ACGT / low complexity / bad length) via ``umi_filter_lib`` -- the same
-          single, unit-tested classifier the dedup step uses (imported from ``umi_dedup``).
+          single, unit-tested classifier the umifilt stage uses (via ``umi_filter.build_per_read``).
   STEP 1b DROPS anchor-only reads (valid UMI, but no decoded PAYLOAD fragment). Abundance here
           counts only reads that actually decoded a ligand, so a read carrying nothing but the
           backbone/anchor features does not contribute to a molecule's read count. Anchors come
@@ -13,8 +13,9 @@ Given one decoded sample (``<STEM>.fused.parquet`` + ``.umis.parquet``), this:
           same authoritative source ``build_featurecounts.py`` uses.
   STEP 2  clusters the surviving UMIs with ``starcode -d 1 -s`` (spheres, Levenshtein distance 1)
           and CORRECTS each read's fused UMI to its cluster's most-abundant ed<=1 variant
-          (starcode's centroid, col1). Unlike the dedup step, NO read is dropped -- every read that
-          passes STEP 1 is written, just relabelled.
+          (starcode's centroid, col1). NO read is dropped -- every read that passes STEP 1 is
+          written, just relabelled. This is the ONLY stage that runs starcode; the pipeline never
+          collapses UMIs, so correction is what starcode is here for.
   STEP 3  writes, per sample:
             <STEM>.fused.parquet   one row per KEPT read: read_acc, strand, fused_seq (original),
                                    fused_len, fused_seq_corrected, umi_read_count (reads sharing
@@ -23,8 +24,9 @@ Given one decoded sample (``<STEM>.fused.parquet`` + ``.umis.parquet``), this:
             <STEM>.umi_summary.tsv one-row filter/correction summary
           plus the starcode I/O (<STEM>.umi_counts.tsv / .umi_clusters.tsv) for provenance.
 
-Shared helpers (build_per_read, run_starcode, prepare_dst, part, ...) are imported from
-``umi_dedup`` so the two scripts cannot drift. Deterministic: stable sorts throughout.
+The UMI classification (``build_per_read`` / ``CLASS_ORDER``) is imported from ``umi_filter`` so the
+two UMI stages cannot drift about what counts as garbage; the sample-tree IO comes from the neutral
+``tree_io``. Deterministic: stable sorts throughout.
 
 CLI:
     umi_correct.py --src-stem PATH --dst-dir DIR --qc-dir DIR
@@ -34,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,12 +44,36 @@ from pathlib import Path
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tree_io as tio                 # stage-neutral sample-tree IO (part / prepare_dst / ...)
+import umi_filter as ufilt            # the shared UMI classification: build_per_read / CLASS_ORDER
 import umi_filter_lib as uf
-import umi_dedup as ud  # reuse build_per_read / run_starcode / starcode_version / prepare_dst / part / CLASS_ORDER
 from ligand_vocab import anchor_set  # authoritative backbone/anchor names (from the umis parquet)
 from complexity_lib import c_eff, collision_prob     # depth-robust effective complexity (see complexity_lib docstring)
 
 TOOL_VERSION = "umi_correct.py/1.0"
+
+# starcode clustering is pinned to a SINGLE thread on purpose. Multithreaded starcode is
+# functionally identical (same clusters, counts, centroids, row order) but emits the
+# comma-separated col3 member SEQUENCES in a thread-schedule-dependent order, which makes the
+# raw <STEM>.umi_clusters.tsv non-byte-reproducible across re-runs (empirically verified:
+# repeated -t 8 runs on the same input DIFFER byte-for-byte, differing only in col3 member order;
+# -t 1 runs are byte-identical). -t 1 costs ~0.5s/sample here (~600k unique UMIs). Downstream is
+# member-order-invariant (every parquet is re-sorted by read_acc), so results are identical either
+# way. This lives here because correction is the only stage that runs starcode.
+STARCODE_THREADS = 1
+
+
+def run_starcode(starcode: str, counts_tsv: Path, clusters_tsv: Path) -> list[str]:
+    """Run starcode -d 1 -s --print-clusters -t 1; return the exact argv (for provenance).
+
+    Pinned to one thread so the persisted raw cluster TSV is byte-reproducible (see note above).
+    """
+    argv = [starcode, "-d", "1", "-s", "--print-clusters",
+            "-t", str(STARCODE_THREADS), "-i", str(counts_tsv), "-o", str(clusters_tsv)]
+    res = subprocess.run(argv, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"starcode failed ({res.returncode}):\n{res.stderr}")
+    return argv
 
 
 def parse_cluster_centroids(clusters_tsv: Path):
@@ -89,22 +116,23 @@ def main(argv: list[str]) -> int:
     dst_dir = Path(args.dst_dir).resolve()
     qc_dir = Path(args.qc_dir).resolve()
 
-    fused_pq = ud.part(src_stem, ".fused.parquet")
-    umis_pq = ud.part(src_stem, ".umis.parquet")
-    frags_pq = ud.part(src_stem, ".fragments.parquet")
+    fused_pq = tio.part(src_stem, ".fused.parquet")
+    umis_pq = tio.part(src_stem, ".umis.parquet")
+    frags_pq = tio.part(src_stem, ".fragments.parquet")
+    src_log = tio.part(src_stem, ".ligateddna.log")
     for p in (fused_pq, umis_pq, frags_pq):
         if not p.exists():
             print(f"[FATAL] missing input: {p}", file=sys.stderr)
             return 1
 
-    ud.prepare_dst(dst_dir, args.force)
+    tio.prepare_dst(dst_dir, args.force)
     qc_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- STEP 1: QC filter -----------------------------------------------------------------
-    perread = ud.build_per_read(fused_pq, umis_pq, args.max_homopolymer, args.max_base_frac)
+    perread = ufilt.build_per_read(fused_pq, umis_pq, args.max_homopolymer, args.max_base_frac)
     reads_in = perread.height
     class_counts = dict(perread.group_by("umi_class").agg(pl.len().alias("n")).iter_rows())
-    dropped = {c: int(class_counts.get(c, 0)) for c in ud.CLASS_ORDER}
+    dropped = {c: int(class_counts.get(c, 0)) for c in ufilt.CLASS_ORDER}
     dropped_total = sum(dropped.values())
     umi_ok = perread.filter(pl.col("umi_class") == "keep").select("read_acc", "fused_seq")
     reads_umi_ok = umi_ok.height
@@ -123,6 +151,24 @@ def main(argv: list[str]) -> int:
     dropped_no_payload = reads_umi_ok - reads_kept
     n_species_raw = int(kept["fused_seq"].n_unique())
 
+    # ---- audit: one row per INPUT read ------------------------------------------------------
+    # A DROPPED read is still here, carrying the class that explains why -- the only per-read record
+    # of that; the summary keeps the counts alone. `kept` distinguishes the two drop reasons: a
+    # garbage UMI (umi_class != "keep") from an anchor-only read (umi_class == "keep", kept False).
+    kept_accs = kept.select("read_acc").with_columns(pl.lit(True).alias("kept"))
+    audit = (
+        perread.join(kept_accs, on="read_acc", how="left")
+        .with_columns(pl.col("kept").fill_null(False))
+        .select(
+            "read_acc", "fused_seq", "fused_len", "maxrun", "max_base_frac",
+            "mean_umi_phred", "n_umi_bases_below_q10", "umi_class", "kept",
+        )
+        .sort("read_acc")
+    )
+    assert audit.height == reads_in
+    assert int(audit.select(pl.col("kept").sum()).item()) == reads_kept
+    audit.write_parquet(qc_dir / f"{stem}.umi_audit.parquet")
+
     # ---- STEP 2: correct to the abundant ed<=1 centroid ------------------------------------
     counts_tsv = qc_dir / f"{stem}.umi_counts.tsv"
     clusters_tsv = qc_dir / f"{stem}.umi_clusters.tsv"
@@ -137,7 +183,7 @@ def main(argv: list[str]) -> int:
         starcode_argv = ["<skipped: no kept reads>"]
         corr_map = pl.DataFrame(schema={"fused_seq": pl.String, "fused_seq_corrected": pl.String})
     else:
-        starcode_argv = ud.run_starcode(args.starcode, counts_tsv, clusters_tsv)
+        starcode_argv = run_starcode(args.starcode, counts_tsv, clusters_tsv)
         cent_rows = parse_cluster_centroids(clusters_tsv)
         seqs, cents = [], []
         for centroid, _tot, members in cent_rows:
@@ -179,10 +225,31 @@ def main(argv: list[str]) -> int:
 
     species.write_csv(dst_dir / f"{stem}.umi_species.tsv", separator="\t", include_header=True)
 
+    # Carry the decode UMI ROWS through, filtered to the kept reads. featurecount and report_sample
+    # derive the anchor VOCABULARY from this file (ligand_vocab.anchor_set), and they find it by
+    # stem -- so a decode-shaped tree must carry it or they cannot run here.
+    tio.write_filtered_parquet(umis_pq, dst_dir / f"{stem}.umis.parquet",
+                               out.select("read_acc"), ["read_acc", "umi_index"])
+
+    # ligateddna.log: copied + a provenance block, so the tree records how it was made. parse_log
+    # recovers the expected-sequences CSV from it, which every report needs.
+    _ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _orig = src_log.read_text() if src_log.exists() else ""
+    (dst_dir / f"{stem}.ligateddna.log").write_text(_orig + (
+        "\n\n### umi_correct provenance ###\n"
+        f"tool: {TOOL_VERSION}\n"
+        f"timestamp_utc: {_ts}\n"
+        f"mode: filter + ed<=1 correct (NO collapse -- this data must not be UMI-deduplicated)\n"
+        f"params: max_homopolymer={args.max_homopolymer} max_base_frac={args.max_base_frac} "
+        f"umi_len_window=[{uf.UMI_LEN_MIN},{uf.UMI_LEN_MAX}] starcode_threads={STARCODE_THREADS}\n"
+        f"counts: reads_in={reads_in} dropped_total={dropped_total} "
+        f"reads_umi_ok={reads_umi_ok} dropped_no_payload={dropped_no_payload} "
+        f"reads_kept={reads_kept} n_reads_relabeled={n_reads_relabeled}\n"))
+
     # Carry the decode FRAGMENT CALLS through, filtered to the kept reads and otherwise untouched.
     # UMI correction filters reads and rewrites the UMI sequence; it changes NOTHING at the fragment
     # level -- fragment_id / start / stop / edit_distance are exactly as the decoder emitted them. Keeping
-    # them here makes the umi/ tree self-contained: corrected UMI + the decoded architecture (including
+    # them here makes the tree self-contained: corrected UMI + the decoded architecture (including
     # the start/stop positions needed to rebuild the POSITIONAL fragment vector) in one place.
     (frags.join(out.select("read_acc"), on="read_acc", how="semi")
      .sort([c for c in ("read_acc", "start", "stop", "fragment_id") if c in frags.columns])
