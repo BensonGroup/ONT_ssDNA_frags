@@ -40,21 +40,31 @@ minimap2 = "*"
 samtools = "*"
 bwa = ">=0.7.19,<0.8"
 
-# Consensus (PDF: "Consensus -> NGSpeciesID"). Heavy deps (medaka), kept isolated.
-# Binary tools come from conda. ngspeciesid + edlib come from PyPI because conda
-# has no linux-aarch64 build of edlib (a hard dep of conda's ngspeciesid).
-# Installing UPSTREAM ngspeciesid via pip pulls the correct Python dep closure
-# (edlib, parasail, ...); you then overlay your patched NGSpeciesID_LisaE
-# (which exposes `--l` SPOA alignment mode) on top. See SETUP_NOTES.md.
+# Consensus (PDF: "Consensus -> NGSpeciesID"). Heavy deps (medaka -> pytorch), kept isolated.
+#
+# NGSpeciesID is deliberately NOT a pypi-dependency. PyPI's 0.3.1 pins parasail==1.2.4
+# while conda supplies parasail-python 1.3.4, so uv silently backtracks to NGSpeciesID
+# 0.1.0.0 (2020) -- which has no `--l` SPOA passthrough. Instead we vendor our patched
+# 0.3.1 fork at workflow/tools/NGSpeciesID_LisaE and run it by path (`ngspeciesid` task).
+#
+# Its only third-party imports are edlib + parasail, both from conda. Note the package is
+# `python-edlib`, not `edlib`: conda has no linux-aarch64 build of `edlib` in bioconda or
+# conda-forge. Binaries the fork shells out to: spoa, minimap2, racon, medaka_consensus.
 [feature.consensus.dependencies]
+python = "3.12.*"        # explicit: no-default-feature drops the root [dependencies] pin
+parasail-python = "*"    # import parasail
+python-edlib = "*"       # import edlib  (aarch64-only name for conda's edlib)
 spoa = "*"
 racon = "*"
 medaka = "*"
 minimap2 = "*"
 samtools = "*"
 
-[feature.consensus.pypi-dependencies]
-NGSpeciesID = "*"
+# Run by path: `python <script>` puts the script's dir on sys.path[0], so `from modules
+# import ...` resolves to the vendored package with no PYTHONPATH. Pixi forwards trailing
+# args, so: pixi run -e consensus ngspeciesid --fastq reads.fq --ont --consensus --l 0 ...
+[feature.consensus.tasks]
+ngspeciesid = "python $PIXI_PROJECT_ROOT/workflow/tools/NGSpeciesID_LisaE/NGSpeciesID"
 
 # Preprocessing (pychopper phmm): orient + full-length-classify reads, retain
 # primers as UMI anchors. phmm backend trains construct-specific primer HMMs via

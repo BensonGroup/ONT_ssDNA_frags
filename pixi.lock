@@ -29,8 +29,6 @@ environments:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
     - url: https://conda.anaconda.org/bioconda/
-    indexes:
-    - https://pypi.org/simple
     packages:
       linux-aarch64:
       - conda: https://conda.anaconda.org/bioconda/linux-aarch64/bcftools-1.23.1-h89c24a7_0.conda
@@ -164,7 +162,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/urllib3-2.7.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wurlitzer-3.1.1-pyhd8ed1ab_1.conda
-      - pypi: https://files.pythonhosted.org/packages/1a/8a/e9f06e79019630da1231974cb164239a117e6680dc38529db29f9837956e/NGSpeciesID-0.1.0.0.tar.gz
   default:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -6283,14 +6280,6 @@ packages:
   - tqdm
   - numpy
   - six
-- pypi: https://files.pythonhosted.org/packages/1a/8a/e9f06e79019630da1231974cb164239a117e6680dc38529db29f9837956e/NGSpeciesID-0.1.0.0.tar.gz
-  name: ngspeciesid
-  version: 0.1.0.0
-  sha256: 9c800922c173b86fd776285355978bed121f8d9581fdcac8652a2f66cb5d6f5b
-  requires_dist:
-  - parasail>=1.1.11
-  - edlib>=1.1.2
-  requires_python: '!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,<4'
 - pypi: https://files.pythonhosted.org/packages/c1/40/37c45bb4b5e345664bd970c3294349d1e35d4ad5794f808324bbef6ff9e7/biopython-1.87-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl
   name: biopython
   version: '1.87'

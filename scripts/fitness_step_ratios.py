@@ -41,7 +41,7 @@ reconstructed -- more IO for no gain.
 
 CLI (all defaulted, so it runs with no args from the repo root)
 ---------------------------------------------------------------
-    pixi run -e default python workflow/scripts/fitness_step_ratios.py \
+    pixi run -e default python scripts/fitness_step_ratios.py \
       --fragvec-dir results/fragvec \
       --meta        results/umi/sample_metadata.tsv \
       --subjects    A549,MDA \
@@ -67,7 +67,9 @@ from pathlib import Path
 
 import polars as pl
 
-RPM = 1_000_000.0
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fitness_lib import RPM, group_long_path, sample_depths   # noqa: E402  one definition of T
+
 _ROUND_RE = re.compile(r"_R(\d+)$")
 
 
@@ -122,7 +124,7 @@ def group_step_table(
         vector, <log2 step cols...>, reads_R<r>..., max_reads
     and steps is the ordered list of log2 step column names.
     """
-    long_p = fragvec_dir / f"{group}.fragvec_x_sample.long.parquet"
+    long_p = group_long_path(fragvec_dir, group)
     samples_p = fragvec_dir / f"{group}.fragvec_x_sample.samples.tsv"
     if not long_p.exists():
         raise SystemExit(f"[FATAL] missing matrix: {long_p}")
@@ -134,10 +136,9 @@ def group_step_table(
 
     df = pl.read_parquet(long_p, columns=["vector", "sample", "n_reads"])
 
-    # depth per sample over the FULL table (true frequency denominator)
-    tot = dict(
-        df.group_by("sample").agg(pl.col("n_reads").sum().alias("T")).iter_rows()
-    )
+    # depth per sample over the FULL table (true frequency denominator). Shared with
+    # fitness_lib.auto_min_log2_sum, which prices the threshold off exactly this number.
+    tot = sample_depths(df)
 
     wide = df.pivot(
         on="sample", index="vector", values="n_reads", aggregate_function="sum"
