@@ -111,6 +111,6 @@ rule report_cross:
         r"""
         L2F_BASE="{params.base}" L2F_R0_STEM="{params.r0}" L2F_SAMPLES="{input.meta}" \
         L2F_COV_BASE="{params.cov_base}" L2F_R0_COV="{params.r0_cov}" \
-        L2F_MIN_COVERAGE="{params.mincov}" \
+        L2F_MIN_COVERAGE="{params.mincov}" L2F_REPORT_STAGE="{wildcards.crossbase}" \
             pixi run -e default python "{params.script}"
         """

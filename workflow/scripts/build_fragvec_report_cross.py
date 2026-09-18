@@ -1,21 +1,21 @@
 #!/usr/bin/env python
-"""Cross-sample fragment-vector report: the two-axis readout (abundance + incidence).
+"""Cross-sample fragvec report: the two-axis readout (abundance + incidence).
 
 Descriptive workflow QC. One self-contained HTML file, plotly inlined.
 
 Panels:
-  * Summary / complexity collapse -- distinct fragment vectors per sample. Selection COLLAPSES the
+  * Summary / complexity collapse -- distinct fragvecs per sample. Selection COLLAPSES the
     library (A549: ~103k vectors at R1 -> ~10k at R5) and concentrates reads onto fewer vectors.
-  * Incidence vs abundance -- n_umis (independent clones) against n_reads, per vector. Points near the
-    diagonal are carried by MANY clones (reproducible selection); points far BELOW are many reads from
-    FEW clones (a single amplified lineage / PCR jackpot) and must not be read as enrichment.
-  * Jackpot table -- the vectors that look enriched but rest on one or two clones.
+  * Incidence vs abundance -- n_umis (independent UMIs) against n_reads, per vector. Points near the
+    diagonal are carried by MANY UMIs (reproducible selection); points far BELOW are many reads from
+    FEW UMIs (a single amplified lineage / PCR jackpot) and must not be read as enrichment.
+  * Jackpot table -- the vectors that look enriched but rest on one or two UMIs.
   * Enrichment trajectories -- depth-normalised counts across rounds (Kuai et al. 2018:
     n_reads * n_vectors / total_reads), R0 as baseline. Sub-threshold counts are greyed: single-digit
     counts do not reproduce between replicates.
-  * Cross-arm stratification -- for vectors enriched in BOTH cell lines, is the agreement CLONE-SHARED
-    (weak: both arms inherited the same clones from the pre-split amplified pool) or CLONE-INDEPENDENT
-    (strong: different clones reached the same vector in each arm)?
+  * Cross-arm stratification -- for vectors enriched in BOTH cell lines, is the agreement UMI-SHARED
+    (weak: both arms inherited the same UMIs from the pre-split amplified pool) or UMI-INDEPENDENT
+    (strong: different UMIs reached the same vector in each arm)?
 
 Env (set by rule report_fragvec_cross):
     L2F_BASE       fragvec/ dir (globbed for sample subdirs + <group>.fragvec_x_sample.long.parquet)
@@ -104,11 +104,12 @@ def summary_table(samples, summ, gcol):
     cols = ["reads_decoded", "reads_payload", "n_vectors", "c_eff", "n_over_c_eff",
             "mean_reads_per_vector", "max_reads_vector", "n_vectors_ge_min",
             "pct_reads_in_vectors_ge_min"]
+    labels = {"reads_payload": "reads with fragments"}
     # mark the columns that are properties of the RUN, not of the library
     depth_dep = {"n_vectors", "n_vectors_ge_min", "pct_reads_in_vectors_ge_min"}
     head = "".join(
-        f"<th title='DEPTH-DEPENDENT — do not compare across samples'>{esc(c)} ⚠</th>"
-        if c in depth_dep else f"<th>{esc(c)}</th>" for c in cols)
+        f"<th title='DEPTH-DEPENDENT — do not compare across samples'>{esc(labels.get(c, c))} ⚠</th>"
+        if c in depth_dep else f"<th>{esc(labels.get(c, c))}</th>" for c in cols)
     rows = []
     for s in samples:
         d = summ.get(s["name"], {})
@@ -153,10 +154,10 @@ def fig_collapse(samples, counts, gcol):
                              mode="lines+markers", line=dict(color=GREY, width=2, dash="dot"),
                              marker=dict(size=7, color=colors)))
     fig.update_layout(barmode="group",
-                      yaxis=dict(title="distinct fragment vectors"),
+                      yaxis=dict(title="distinct fragvecs"),
                       yaxis2=dict(title="c_eff", overlaying="y", side="right", type="log"))
     note = (f"<p class='small'><b>Depth varies across these samples "
-            f"({min(depths.values()):,}–{max(depths.values()):,} payload reads, "
+            f"({min(depths.values()):,}–{max(depths.values()):,} fragment reads, "
             f"{max(depths.values())/min(depths.values()):.1f}×).</b> A raw species count grows with "
             f"depth, so the grey bars are <em>not</em> comparable across samples — they are shown only "
             f"to expose the size of the artefact. Compare the blue bars (rarefied to a common "
@@ -166,7 +167,7 @@ def fig_collapse(samples, counts, gcol):
 
 
 def fig_anchor_only(samples, summ, gcol):
-    """Reads with a valid UMI and both anchors but NO payload fragment. They are dropped (they decode no
+    """Reads with a valid UMI and both anchors but NO fragment. They are dropped (they decode no
     ligand), but the fraction VARIES by round — a systematic drift would bias enrichment."""
     names, pct, colors = [], [], []
     for s in samples:
@@ -181,16 +182,16 @@ def fig_anchor_only(samples, summ, gcol):
         return ""
     fig = go.Figure(go.Bar(x=names, y=pct, marker=dict(color=colors),
                            hovertemplate="%{y:.1f}% anchor-only<extra></extra>"))
-    fig.update_yaxes(title="% of decoded reads with NO payload fragment")
+    fig.update_yaxes(title="% of decoded reads with NO fragment")
     return ("<h3>Anchor-only reads (dropped)</h3><p class='small'>Reads carrying a valid UMI and both "
-            "backbone anchors but <b>no payload fragment</b> — they decode no ligand, so they are "
+            "backbone anchors but <b>no fragment</b> — they decode no ligand, so they are "
             "excluded from every count (declared as <code>reads_dropped_anchor_only</code>). Watch for "
             "systematic drift across rounds: if this fraction moves with selection, it biases "
             "enrichment.</p>" + fig_html(style(fig, 340)))
 
 
 def fig_incidence(samples, counts, gcol):
-    """n_umis (independent clones) vs n_reads. Diagonal = trustworthy; far below = jackpot."""
+    """n_umis (independent UMIs) vs n_reads. Diagonal = trustworthy; far below = jackpot."""
     fig = go.Figure()
     for s, first in zip(samples, first_of_group(samples)):
         df = counts[s["name"]].filter(pl.col("n_reads") >= MIN_READS)
@@ -200,15 +201,15 @@ def fig_incidence(samples, counts, gcol):
             x=df["n_reads"].to_list(), y=df["n_umis"].to_list(), mode="markers",
             name=esc(s["group"]), legendgroup=s["group"], showlegend=first,
             marker=dict(size=4, opacity=0.45, color=gcol.get(s["group"], GREY)),
-            hovertemplate="reads %{x}<br>clones %{y}<extra>" + esc(s["name"]) + "</extra>"))
+            hovertemplate="reads %{x}<br>UMIs %{y}<extra>" + esc(s["name"]) + "</extra>"))
     lo, hi = MIN_READS, max((int(counts[s["name"]]["n_reads"].max() or 1)) for s in samples)
-    fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="1 read / clone",
+    fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="1 read / UMI",
                              line=dict(color=GREY, dash="dash")))
     fig.update_xaxes(type="log", title="n_reads  (abundance)")
-    fig.update_yaxes(type="log", title="n_umis  (incidence — independent clones)")
+    fig.update_yaxes(type="log", title="n_umis  (incidence — independent UMIs)")
     return fig_html(style(fig, 520,
-        "Incidence vs abundance — on the dashed line = many independent clones (trustworthy); "
-        "far below = few clones carrying many reads (jackpot)"))
+        "Incidence vs abundance — on the dashed line = many independent UMIs (trustworthy); "
+        "far below = few UMIs carrying many reads (jackpot)"))
 
 
 def jackpot_table(samples, counts, top=25):
@@ -220,12 +221,12 @@ def jackpot_table(samples, counts, top=25):
             rows.append((s["name"], r["vector"], r["n_reads"], r["n_umis"], r["max_reads_per_umi"]))
     rows.sort(key=lambda x: -x[2])
     if not rows:
-        return "<p class='small'>No jackpot vectors (every vector above threshold rests on ≥3 clones).</p>"
+        return "<p class='small'>No jackpot vectors (every vector above threshold rests on ≥3 UMIs).</p>"
     body = "".join(
         f"<tr><td>{esc(a)}</td><td style='font-family:monospace;font-size:.75rem'>{esc(b[:70])}"
         f"{'…' if len(b) > 70 else ''}</td><td class='num'>{c:,}</td><td class='num'>{d}</td>"
         f"<td class='num'>{e:,}</td></tr>" for a, b, c, d, e in rows[:top])
-    return (f"<h3>Jackpot flags</h3><p class='small'>Vectors with ≥{MIN_READS} reads but ≤2 clones — "
+    return (f"<h3>Jackpot flags</h3><p class='small'>Vectors with ≥{MIN_READS} reads but ≤2 UMIs — "
             f"the reads come from one amplified lineage, so the apparent enrichment is NOT independent "
             f"evidence.</p><div style='overflow-x:auto'><table><thead><tr><th>sample</th><th>vector</th>"
             f"<th>n_reads</th><th>n_umis</th><th>max_reads_per_umi</th></tr></thead>"
@@ -265,7 +266,7 @@ def fig_trajectories(group, longp, top=15):
                         symbol=["circle" if n >= MIN_READS else "circle-open" for n in nr]),
             customdata=nr,
             hovertemplate="%{x}<br>%{y:.1f} RPM<br>%{customdata} reads<extra></extra>"))
-    fig.update_yaxes(type="log", title="reads per million payload reads (depth-normalised)")
+    fig.update_yaxes(type="log", title="reads per million fragment reads (depth-normalised)")
     # One legend entry per vector, ~4 per row at this width; the legend grows UPWARD out of the plot
     # area, so reserve its band explicitly or it swallows the title. Height stays 480 -- the plot
     # area pays for the band.
@@ -276,7 +277,7 @@ def fig_trajectories(group, longp, top=15):
 
 
 def cross_arm(samples, groups):
-    """For vectors above threshold in BOTH arms: is the agreement clone-SHARED or clone-INDEPENDENT?"""
+    """For vectors above threshold in BOTH arms: is the agreement UMI-SHARED or UMI-INDEPENDENT?"""
     if len(groups) < 2:
         return ""
     ga, gb = groups[0], groups[1]
@@ -306,21 +307,21 @@ def cross_arm(samples, groups):
     indep = sum(1 for j in jacs if j < 0.01)
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=jacs, nbinsx=40, marker_color="#54A24B"))
-    fig.update_xaxes(title="clone-overlap (Jaccard) between the two arms, per shared vector")
+    fig.update_xaxes(title="UMI-overlap (Jaccard) between the two arms, per shared vector")
     fig.update_yaxes(title="vectors")
     h = fig_html(style(fig, 380, f"Cross-arm agreement: {esc(ga)} vs {esc(gb)}"))
     body = "".join(
         f"<tr><td style='font-family:monospace;font-size:.75rem'>{esc(v[:60])}{'…' if len(v)>60 else ''}</td>"
         f"<td class='num'>{a:,}</td><td class='num'>{b:,}</td><td class='num'>{i:,}</td>"
-        f"<td class='num'>{j:.3f}</td><td>{'clone-SHARED (weak)' if j >= 0.01 else 'clone-INDEPENDENT (strong)'}</td></tr>"
+        f"<td class='num'>{j:.3f}</td><td>{'UMI-SHARED (weak)' if j >= 0.01 else 'UMI-INDEPENDENT (strong)'}</td></tr>"
         for v, a, b, i, j in rows[:20])
     return (f"<h2>Cross-arm stratification</h2><p class='small'>The library was amplified once and then "
-            f"split, so both arms inherited the SAME clones — a vector enriched in both arms via the "
-            f"<em>same</em> clones is correlated ancestry (weak evidence). Via <em>different</em> clones "
+            f"split, so both arms inherited the SAME UMIs — a vector enriched in both arms via the "
+            f"<em>same</em> UMIs is correlated ancestry (weak evidence). Via <em>different</em> UMIs "
             f"it is independent evidence of a real, cell-line-independent effect. "
-            f"<b>{indep:,} / {len(rows):,}</b> shared vectors are clone-independent.</p>{h}"
-            f"<div style='overflow-x:auto'><table><thead><tr><th>vector</th><th>clones {esc(ga)}</th>"
-            f"<th>clones {esc(gb)}</th><th>shared</th><th>Jaccard</th><th>verdict</th></tr></thead>"
+            f"<b>{indep:,} / {len(rows):,}</b> shared vectors are UMI-independent.</p>{h}"
+            f"<div style='overflow-x:auto'><table><thead><tr><th>vector</th><th>UMIs {esc(ga)}</th>"
+            f"<th>UMIs {esc(gb)}</th><th>shared</th><th>Jaccard</th><th>verdict</th></tr></thead>"
             f"<tbody>{body}</tbody></table></div>")
 
 
@@ -344,12 +345,12 @@ def main():
 
     H = ["<!doctype html><html><head><meta charset='utf-8'>",
          "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-         "<title>Fragment-vector quantification — cross-sample</title>", _STYLE,
+         "<title>Fragvec quantification — cross-sample</title>", _STYLE,
          f"<script>{get_plotlyjs()}</script></head><body>",
-         "<h1>Fragment-vector quantification — cross-sample</h1>",
+         "<h1>Fragvec quantification — cross-sample</h1>",
          "<p class='small'>Two axes per vector: <b>n_reads</b> (abundance) and <b>n_umis</b> "
-         "(incidence — independent clones). A vector is only trustworthy when its reads come from many "
-         "clones. Descriptive workflow QC — no biological conclusions are drawn. Figures are coloured "
+         "(incidence — independent UMIs). A vector is only trustworthy when its reads come from many "
+         "UMIs. Descriptive workflow QC — no biological conclusions are drawn. Figures are coloured "
          "by the config <code>group</code>; the initial library is the shared R0 baseline, in grey.</p>",
          color_key_html(gcol, samples),
          summary_table(samples, summ, gcol),

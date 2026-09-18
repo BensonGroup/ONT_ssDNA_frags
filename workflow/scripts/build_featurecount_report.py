@@ -220,11 +220,11 @@ def fig_classes(d):
         marker_color=[d["colors"][r[0]] for r in rows],
         customdata=[[100 * r[1] / payload_total, r[2], r[3]] for r in rows],
         text=[f"{100*r[1]/payload_total:.0f}%" for r in rows], textposition="outside",
-        hovertemplate=("<b>%{x}</b><br>%{y:,} calls (%{customdata[0]:.1f}% of payload)"
+        hovertemplate=("<b>%{x}</b><br>%{y:,} calls (%{customdata[0]:.1f}% of fragment calls)"
                        "<br>Σ mean copies/read %{customdata[1]:.3f}"
                        "<br>%{customdata[2]} features<extra></extra>"),
     ))
-    fig.update_yaxes(type="log", title="total payload calls (log)")
+    fig.update_yaxes(type="log", title="total fragment calls (log)")
     style(fig, height=360)
     return fig_html(fig)
 
@@ -235,8 +235,8 @@ def fig_perread(d):
     labels = [str(x) for x in xs[:-1]] + [f"{MAXBUCKET}+"]
     fig = go.Figure(go.Bar(
         x=labels, y=ys, marker_color="#4f9cff",
-        hovertemplate="%{x} payload fragments<br><b>%{y:,}</b> reads<extra></extra>"))
-    fig.update_xaxes(title="payload fragment copies in a read")
+        hovertemplate="%{x} fragments<br><b>%{y:,}</b> reads<extra></extra>"))
+    fig.update_xaxes(title="fragment copies in a read")
     fig.update_yaxes(title="reads")
     style(fig, height=340)
     return fig_html(fig)
@@ -247,7 +247,7 @@ def fig_editdist(d):
     fig = go.Figure(go.Bar(
         x=xs, y=[d["edh"][x] for x in xs], marker_color="#3fb950",
         hovertemplate="edit distance %{x}<br><b>%{y:,}</b> calls<extra></extra>"))
-    fig.update_xaxes(title="edit distance (payload calls)", dtick=1)
+    fig.update_xaxes(title="edit distance (fragment calls)", dtick=1)
     fig.update_yaxes(title="calls")
     style(fig, height=340)
     return fig_html(fig)
@@ -285,11 +285,11 @@ def stat_tiles(d):
     carry = f"{100*wp/n:.1f}% carry ≥1 ligand fragment" if n else "no reads decoded"
     tiles = [
         ("reads decoded", f"{n:,}", "≥1 UMI-anchored, fused"),
-        ("with a payload", f"{wp:,}", carry),
-        ("payload calls", f"{int(s['n_payload_rows']):,}", "ligand-fragment detections"),
-        ("payload features", f"{int(s['n_payload_features'])}", "distinct incl. _rc orientation"),
-        ("copies / read", f"{s['mean_payload_copies_per_read']:.2f}", "payload calls ÷ reads"),
-        ("copies / read+", f"{s['mean_payload_copies_per_read_with']:.2f}", "÷ reads with payload"),
+        ("with a fragment", f"{wp:,}", carry),
+        ("fragment calls", f"{int(s['n_payload_rows']):,}", "ligand-fragment detections"),
+        ("fragment features", f"{int(s['n_payload_features'])}", "distinct incl. _rc orientation"),
+        ("copies / read", f"{s['mean_payload_copies_per_read']:.2f}", "fragment calls ÷ reads"),
+        ("copies / read+", f"{s['mean_payload_copies_per_read_with']:.2f}", "÷ reads with ≥1 fragment"),
     ]
     cells = "".join(
         f'<div class="tile"><div class="tk">{esc(k)}</div>'
@@ -417,15 +417,15 @@ def main():
         '<div class="callout aim"><p><b>Aim.</b> For every ligand fragment, how many copies does '
         "an average decoded read carry (<b>mean copies / read</b> = total calls ÷ reads decoded)? "
         "Everything is <b>strand-collapsed</b> (a feature and its <code>_rc</code> are one row) and "
-        "split into <b>payload</b> ligand fragments vs the <b>UMI anchors</b> (backbone, one per "
+        "split into <b>ligand fragments</b> vs the <b>UMI anchors</b> (backbone, one per "
         "read by construction). The construct vocabulary and its classes are derived from the "
-        f"decode itself — {n_payload_feats} payload features across {n_classes} structural "
+        f"decode itself — {n_payload_feats} fragment features across {n_classes} structural "
         "classes.</p></div>",
 
         stat_tiles(d),
         absent_note,
 
-        "<h2>Every payload feature</h2>",
+        "<h2>Every fragment feature</h2>",
         "<p>Mean copies per decoded read for each ligand fragment (log axis), grouped and coloured "
         "by structural class. Longer/unique fragments are the trustworthy signal; very short "
         "Linear calls are partly mis-segmentation, so read the profile by class.</p>",
@@ -438,13 +438,13 @@ def main():
         fig_backbone(d),
 
         "<h2>By structural class</h2>",
-        "<p>Total payload calls contributed by each class (log axis; label = share of all payload "
+        "<p>Total fragment calls contributed by each class (log axis; label = share of all fragment "
         "calls). Hover for the summed mean-copies/read and feature count.</p>",
         fig_classes(d),
 
         "<h2>Multiplicity &amp; quality</h2>",
-        "<p>Left: how many payload fragment copies a read carries (0 = amplification loop-only "
-        "reads). Right: edit-distance of payload calls against the expected sequences "
+        "<p>Left: how many fragment copies a read carries (0 = amplification loop-only "
+        "reads). Right: edit-distance of fragment calls against the expected sequences "
         "(lower = cleaner match).</p>",
         '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-start">',
         f'<div style="flex:1;min-width:320px">{fig_perread(d)}</div>',
@@ -465,8 +465,8 @@ def main():
         "(<code>summary.tsv n_reads</code>). Strand-collapsed (fwd + <code>_rc</code>).</dd>",
         "<dt>reads decoded</dt><dd>UMI-anchored reads that fused and passed the anchor-window trim; "
         "not total sequenced reads.</dd>",
-        "<dt>payload vs anchor</dt><dd>Anchors (UMI constructs) are the backbone, read from the "
-        "tool's <code>umis.parquet</code> and reported separately; payload = the ligand fragments.</dd>",
+        "<dt>fragment vs anchor</dt><dd>UMI anchors are the backbone, read from the "
+        "tool's <code>umis.parquet</code> and reported separately from the ligand fragments.</dd>",
         "<dt>class</dt><dd>Tokenised from each feature name (size/strand tokens stripped); nothing "
         "is hard-coded, so the class set is whatever the construct library contains.</dd>",
         "<dt>edit distance</dt><dd>Per-call edit distance to the expected sequence emitted by the "

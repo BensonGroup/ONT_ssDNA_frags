@@ -17,6 +17,7 @@ the cell-line / round of each sample is parsed from its name, and the construct 
         <base>/cross_sample_featurecount_report.html   (interactive, plotly.js inlined)
 
     L2F_BASE default = ligand2frags_new2
+    L2F_REPORT_STAGE = decode | umicorr | umi (defaults to the base directory name)
 
 Run: pixi run python workflow/build_featurecount_report_cross.py
 """
@@ -51,6 +52,9 @@ R0_STEM = (Path(_r0) if _r0 else None)
 if R0_STEM is not None and not R0_STEM.is_absolute():
     R0_STEM = ROOT / R0_STEM
 OUT = BASE / "cross_sample_featurecount_report.html"
+# The workflow passes the stage explicitly; standalone runs can use the tree name.
+REPORT_STAGE = os.environ.get("L2F_REPORT_STAGE", BASE.name)
+FILTERED_REPORT = REPORT_STAGE in {"umi", "umicorr"}
 
 # The RAW decode tree, where `rule coverage` wrote each sample's per-read <S>.coverage.parquet.
 # The coverage panel RENDERS that and computes nothing: coverage is a property of the DECODE step,
@@ -378,13 +382,13 @@ def fig_class_composition(d):
             ys.append(100 * tot / all_tot)
         fig.add_trace(go.Bar(x=xpos, y=ys, name=c, marker_color=d["colors"][c], customdata=xfull,
                              hovertemplate="%{customdata}<br>" + c
-                             + " %{y:.1f}% of payload<extra></extra>"))
+                             + " %{y:.1f}% of fragment calls<extra></extra>"))
     fig.update_layout(barmode="stack")
     for x in line_boundaries(samples):
         fig.add_vline(x=x, line_color=GREY, line_width=2)
     group_band(fig, samples, yshift=16)
     fig.update_xaxes(tickmode="array", tickvals=xpos, ticktext=xshort, tickangle=-40)
-    fig.update_yaxes(title="% of payload calls", range=[0, 100])
+    fig.update_yaxes(title="% of fragment calls", range=[0, 100])
     style(fig, height=420)
     fig.update_layout(margin=dict(t=88))      # room for the rotated group band above the bars
     return fig_html(fig)
@@ -567,8 +571,8 @@ def fig_multiplicity(d):
             x=labels, y=ys, mode="lines+markers", name=col_label(s), legendgroup=s["line"],
             marker=dict(size=5, color=cols[nm]),
             line=dict(width=1.6, color=cols[nm], dash=sample_dash(s)),
-            hovertemplate=f"{col_label(s)}<br>%{{x}} payload frags<br>%{{y:.1f}}% of reads<extra></extra>"))
-    fig.update_xaxes(title="payload fragment copies in a read")
+            hovertemplate=f"{col_label(s)}<br>%{{x}} fragments<br>%{{y:.1f}}% of reads<extra></extra>"))
+    fig.update_xaxes(title="fragment copies in a read")
     fig.update_yaxes(title="% of reads")
     style(fig, height=380)
     return fig_html(fig)
@@ -587,18 +591,17 @@ def fig_quality(d):
             marker=dict(size=5, color=cols[nm]),
             line=dict(width=1.6, color=cols[nm], dash=sample_dash(s)),
             hovertemplate=f"{col_label(s)}<br>edit distance %{{x}}<br>%{{y:.1f}}% of calls<extra></extra>"))
-    fig.update_xaxes(title="edit distance (payload calls)", dtick=1)
+    fig.update_xaxes(title="edit distance (fragment calls)", dtick=1)
     fig.update_yaxes(title="% of calls")
     style(fig, height=380)
     return fig_html(fig)
 
 
 def fig_depth(d):
-    """Absolute sequencing depth per sample: reads decoded, and the payload-bearing subset.
+    """Absolute sequencing depth per sample: reads decoded, and the fragment-bearing subset.
 
-    The other quality panels are all normalised per sample, so this is the only place the raw
-    depth shows. Both series carry the sample's own colour (shared with the coverage plot beside
-    it) and are told apart by opacity, not hue."""
+    Filtered trees have one retained-read series. Raw decode also shows the
+    fragment-bearing subset, with the same sample colours and distinct opacity."""
     cols = sample_palette(d)
     samples = d["samples"]
     xpos = list(range(len(samples)))          # numeric x so duplicate round labels never merge bars
@@ -608,14 +611,22 @@ def fig_depth(d):
     n_reads = [int(d["meta"][s["name"]]["n_reads"]) for s in samples]
     n_pay = [int(d["meta"][s["name"]]["n_reads_with_payload"]) for s in samples]
 
+    if FILTERED_REPORT:
+        inconsistent = [s["name"] for s, total, with_fragment in zip(samples, n_reads, n_pay)
+                        if total != with_fragment]
+        if inconsistent:
+            raise ValueError("Filtered report includes reads without a fragment: "
+                             + ", ".join(inconsistent))
+    label = "reads retained" if FILTERED_REPORT else "reads decoded"
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=xpos, y=n_reads, name="reads decoded", customdata=xfull,
-                         marker=dict(color=bar, opacity=0.42),
-                         hovertemplate="%{customdata}<br>reads decoded %{y:,}<extra></extra>"))
-    fig.add_trace(go.Bar(x=xpos, y=n_pay, name="with payload", customdata=xfull,
-                         marker=dict(color=bar),
-                         hovertemplate="%{customdata}<br>with &ge;1 payload frag "
-                                       "%{y:,}<extra></extra>"))
+    fig.add_trace(go.Bar(x=xpos, y=n_reads, name=label, customdata=xfull,
+                         marker=dict(color=bar, opacity=1.0 if FILTERED_REPORT else 0.42),
+                         hovertemplate="%{customdata}<br>" + label + " %{y:,}<extra></extra>"))
+    if not FILTERED_REPORT:
+        fig.add_trace(go.Bar(x=xpos, y=n_pay, name="with ≥1 fragment", customdata=xfull,
+                             marker=dict(color=bar),
+                             hovertemplate="%{customdata}<br>with &ge;1 fragment "
+                                           "%{y:,}<extra></extra>"))
     # a legend swatch can't stand for a per-bar colour list, and the coverage plot beside this one
     # already legends the sample colours -- the two series are named in the hover and the caption.
     fig.update_layout(barmode="group", bargap=0.25, bargroupgap=0.05, showlegend=False)
@@ -627,6 +638,14 @@ def fig_depth(d):
     style(fig, height=380)
     fig.update_layout(margin=dict(t=88))      # room for the rotated group band above the bars
     return fig_html(fig)
+
+
+def depth_caption():
+    if FILTERED_REPORT:
+        return ("<b>Depth</b> (left): reads retained per sample after filtering. "
+                "Every retained read contains at least one fragment. ")
+    return ("<b>Depth</b> (left): reads decoded per sample (pale) and the subset "
+            "carrying at least one fragment (solid). ")
 
 
 def fig_coverage(d):
@@ -665,7 +684,8 @@ def fig_coverage(d):
 # ------------------------------------------------------------------------ table
 def overview_table(d):
     rows = ["<table>", "<thead><tr><th>sample</th><th>group</th><th class=num>round</th>"
-            "<th class=num>reads decoded</th><th class=num>% with payload</th>"
+            f"<th class=num>{'reads retained' if FILTERED_REPORT else 'reads decoded'}</th>"
+            "<th class=num>% with ≥1 fragment</th>"
             "<th class=num>copies/read</th></tr></thead>", "<tbody>"]
     for s in d["samples"]:
         m = d["meta"][s["name"]]
@@ -741,9 +761,8 @@ def main():
         "decodes themselves.</p></div>",
 
         "<h2>Quality</h2>",
-        "<p><b>Depth</b> (left): reads decoded per sample (pale) and the subset carrying at least "
-        "one payload fragment (solid) — the absolute scale that every other panel here normalises "
-        "away. <b>Coverage</b> (right): fraction of each read's length (post-trim, from "
+        "<p>" + depth_caption()
+        + "<b>Coverage</b> (right): fraction of each read's length (post-trim, from "
         "<code>fused_reads.fq</code>) that is covered by expected-sequence fragments — how "
         "completely the panel explains a read, as the distribution of reads per sample. The "
         "coverage axis starts at 60% because fewer than 0.2% of reads fall below it.</p>",
@@ -752,8 +771,8 @@ def main():
         f'<div style="min-width:0">{cov_html}</div>',
         "</div>",
         cov_note,
-        "<p>Left: how many payload fragment copies a read carries (0 = amplification loop-only "
-        "reads), as % of each sample's reads. Right: edit-distance of payload calls against the "
+        "<p>Left: how many fragment copies a read carries (0 = amplification loop-only "
+        "reads), as % of each sample's reads. Right: edit-distance of fragment calls against the "
         "expected sequences (lower = cleaner match), as % of each sample's calls. Both normalised "
         "per sample so sequencing depth doesn't dominate; toggle samples in the legend.</p>",
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start">',
@@ -774,7 +793,7 @@ def main():
         fig_heatmap(d),
 
         "<h2>Class composition per sample</h2>",
-        "<p>Share of payload calls contributed by each structural class — how the ligand class mix "
+        "<p>Share of fragment calls contributed by each structural class — how the ligand class mix "
         "moves across rounds and differs between groups.</p>",
         fig_class_composition(d),
 

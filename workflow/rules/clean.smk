@@ -19,13 +19,16 @@ rule deplete:
     shell:
         r"""
         set -euo pipefail
-        nin=$(( $(wc -l < "{input.reads}") / 4 ))
         pixi run -e default bash -c '
           set -o pipefail
           minimap2 -ax {params.preset} -Y --secondary=no -t {threads} "{input.mmi}" "{input.reads}" 2>"{output.log}" \
             | samtools fastq -n -f 4 - > "{output.fq}"
         '
-        nout=$(( $(wc -l < "{output.fq}") / 4 ))
+        nin=$(pixi run -e default seqkit stats -T "{input.reads}" \
+              | awk -F '\t' 'NR == 2 {{print $4}}')
+        nout=$(pixi run -e default seqkit stats -T "{output.fq}" \
+               | awk -F '\t' 'NR == 2 {{print $4}}')
+
         printf '%s\t%s\t%s\n' "{params.gname}" "$nin" "$nout" > "{output.stats}"
         """
 

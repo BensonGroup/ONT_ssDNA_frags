@@ -398,7 +398,7 @@ def ceff_table(samples, cplx, collapse, gcol):
     head = (
         "<tr>"
         "<th>sample</th>"
-        "<th title='total payload reads'>N reads</th>"
+        "<th title='total fragment reads'>N reads</th>"
         "<th title='DEPTH-DEPENDENT — do not compare across samples'>distinct ⚠</th>"
         f"<th title='distinct UMIs rarefied to a common depth of {fmt(m)} reads'>rarefied</th>"
         "<th title='observed duplicate read-pairs — how much evidence C_eff rests on'>dup pairs</th>"
@@ -671,13 +671,13 @@ def fig_upset(group, gsamples, species, color, top_n=24):
 
 
 def _read_signatures(frags_path):
-    """read_acc -> the read's decoded fragment vector, EXACTLY as the tool emits it.
+    """read_acc -> the read's decoded fragvec, EXACTLY as the tool emits it.
 
     Anchors and `_rc` are KEPT, and both carry information. Reads are already oriented (pychopper),
     so `F1` vs `F1_rc` means the fragment was LIGATED in reverse — a genuinely different species, not
     a read-direction artifact — and the backbone anchors are structural features like any other
     fragment. Same convention as build_featurecounts.py ("counted EXACTLY as the tool emits them").
-    Reads with no payload are already dropped upstream (umi_correct STEP 1b), so nothing can score as
+    Reads with no fragment are already dropped upstream (umi_correct STEP 1b), so nothing can score as
     trivially pure on an anchors-only signature. Sorted, so the multiset (incl. duplicate detections)
     is order-invariant.
     """

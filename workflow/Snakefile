@@ -46,7 +46,7 @@ rule all:
         # The covfilt/ tree itself is pulled in transitively by every branch below; this is the
         # cross-sample QC row, an output in its own right.
         *([f"{OUTDIR}/covfilt/coverage_summary.tsv"] if DECODE_FILTER_ON else []),
-        # the jackpot audit: which clonotypes were flagged, why, and what the blacklist removed.
+        # the jackpot audit: which fragvecs were flagged, why, and what the blacklist removed.
         # A first-class output of the umi step, not a re-render of the reports below.
         *([f"{OUTDIR}/jackpot/{INITIAL}.umi_jackpot_report.html",
            f"{OUTDIR}/jackpot/{INITIAL}.fragvec_jackpot_report.html"] if JACKPOT_ON else []),
@@ -62,6 +62,8 @@ rule all:
         # A sibling of the umi/ branch — independently switchable; run either or both.
         *([f"{OUTDIR}/fragvec/{g}.fragvec_x_sample.reads.mtx" for g in GROUPS] if FRAGVEC_ON else []),
         *([f"{OUTDIR}/fragvec/fragvec_report_cross.html"] if FRAGVEC_ON else []),
+        # Optional outputs are selected by the static-plot rule module.
+        lambda wc: static_plot_targets(),
 
 
 include: "rules/qc.smk"
@@ -77,3 +79,4 @@ include: "rules/jackpot.smk"
 include: "rules/fragvec.smk"
 include: "rules/featurecounts.smk"
 include: "rules/reports.smk"
+include: "rules/static_plots.smk"
