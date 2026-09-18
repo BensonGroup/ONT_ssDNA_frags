@@ -20,3 +20,6 @@ __pycache__/
 # what a plan decided ends up in the code and the commit message. Plans are still kept here (never
 # overwritten: each planning round gets its own dated+versioned file) so they can be re-read locally.
 .claude/
+
+# Local Codex plans, research, and scratch files.
+.codex/

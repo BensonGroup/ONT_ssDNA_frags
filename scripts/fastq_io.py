@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""The single FASTQ reader/writer for the standalone top-read extractors, so `top_vector_reads.py`
-and `clone_top_reads.py` cannot disagree about how a decode record is parsed or emitted (same reason
-`fitness_lib` is shared between the fitness scripts).
+"""The single FASTQ reader/writer for the standalone per-study scripts, so `top_vector_reads.py`,
+`clone_top_reads.py` and `all_umi_consensus.py` cannot disagree about how a decode record is parsed
+or emitted (same reason `fitness_lib` is shared between the fitness scripts).
+
+Two entry points, ONE parser. `iter_fastq_records` streams and yields; `read_fastq_records` is a
+``dict()`` over it. The dict is right when the caller needs random access to a few thousand reads;
+the iterator is what `all_umi_consensus.py --emit-singletons` needs to copy 3.8M reads straight
+back out to disk without first building hundreds of MB of write-once strings.
 
 Both extractors pull sequences out of `results/decode/<sample>/<sample>.fused_reads.fq` by
 `read_acc` -- the header's first whitespace token, `<start>:<stop>|<uuid>`. That file is a real
@@ -43,21 +48,30 @@ from __future__ import annotations
 
 from pathlib import Path
 
-__all__ = ["read_fastq_records", "strand_field", "write_fastq"]
+__all__ = ["iter_fastq_records", "read_fastq_records", "strand_field", "write_fastq"]
 
 
-def read_fastq_records(fq_path, want: set[str]) -> dict[str, tuple[str, str, str]]:
-    """Single streaming pass over a 4-line FASTQ.
+def iter_fastq_records(fq_path, want=None):
+    """Streaming single pass over a 4-line FASTQ, yielding ``(read_acc, header_tail, seq, qual)``
+    in file order and holding ONE record at a time.
 
-    Returns ``read_acc -> (header_tail, sequence, quality)`` for the headers whose first
-    whitespace token is in ``want``. ``header_tail`` is the raw text AFTER that token, returned
-    unparsed -- callers decide what of it to keep (see `strand_field`).
+    `read_fastq_records` materialises a dict of every wanted record, which is right when the
+    caller needs random access to a few thousand reads and wrong when it needs to copy millions
+    of them straight back out to disk. ``all_umi_consensus.py --emit-singletons`` copies
+    3,800,790 singleton reads: that dict would be hundreds of MB of strings each used exactly
+    once. Same parsing and the same fatal invariants -- this IS the parser now, and
+    `read_fastq_records` is a ``dict()`` over it, so the two can never drift apart.
+
+    ``want`` is any container answering ``in`` -- a set, or the caller's ``read_acc -> value``
+    dict, which saves building a second copy of half a million keys. ``None`` means every record.
 
     Fatal on a truncated record or a seq/qual length mismatch: both mean the input is not the
-    decode FASTQ this was pointed at.
+    decode FASTQ this was pointed at. The truncation check fires for EVERY record, wanted or
+    not; the length check only for wanted ones. That asymmetry is deliberate and pinned by the
+    selftest -- a truncated file is malformed no matter what you asked for, but paying a
+    length check on millions of unwanted records is pure cost.
     """
     fq_path = Path(fq_path)
-    out: dict[str, tuple[str, str, str]] = {}
     with open(fq_path) as fh:
         while True:
             header = fh.readline()
@@ -69,14 +83,26 @@ def read_fastq_records(fq_path, want: set[str]) -> dict[str, tuple[str, str, str
                                  f"(expected 4 lines, got fewer)")
             body = header[1:].rstrip("\n")          # header: "@<read_acc> <tail...>"
             acc, _, tail = body.partition(" ")
-            if acc not in want:
+            if want is not None and acc not in want:
                 continue
             seq, qual = seq.rstrip("\n"), qual.rstrip("\n")
             if len(seq) != len(qual):
                 raise SystemExit(f"[FATAL] {fq_path}: {acc} has {len(seq)} bases but "
                                  f"{len(qual)} quality values")
-            out[acc] = (tail, seq, qual)
-    return out
+            yield acc, tail, seq, qual
+
+
+def read_fastq_records(fq_path, want: set[str]) -> dict[str, tuple[str, str, str]]:
+    """Single streaming pass over a 4-line FASTQ, collected into a dict.
+
+    Returns ``read_acc -> (header_tail, sequence, quality)`` for the headers whose first
+    whitespace token is in ``want``. ``header_tail`` is the raw text AFTER that token, returned
+    unparsed -- callers decide what of it to keep (see `strand_field`).
+
+    A duplicated ``read_acc`` resolves last-one-wins, as it always has. For a caller that only
+    streams its records straight back out, use `iter_fastq_records` and hold nothing.
+    """
+    return {acc: (tail, seq, qual) for acc, tail, seq, qual in iter_fastq_records(fq_path, want)}
 
 
 def strand_field(tail: str) -> str:
@@ -155,6 +181,45 @@ def _selftest() -> None:
         assert write_fastq(d / "empty.fq", []) == 0
 
         # ------------------------------------------------------------------ #
+        # iter_fastq_records: the parser both entry points share
+        # ------------------------------------------------------------------ #
+        # want=None yields EVERY record, in file order
+        every = list(iter_fastq_records(src))
+        assert [a for a, _t, _s, _q in every] == ["1:10|aaa", "1:20|bbb", "1:30|ccc"]
+        assert every[1] == ("1:20|bbb", "", "TTTT", "!!!!")
+
+        # `want` filters identically to read_fastq_records, and the dict is exactly a dict()
+        # over the generator -- this is the assertion that keeps the two from drifting.
+        assert {a: (t, s, q) for a, t, s, q in iter_fastq_records(src, {"1:10|aaa", "1:20|bbb"})} \
+            == read_fastq_records(src, {"1:10|aaa", "1:20|bbb"})
+
+        # a dict is a legal `want` -- the singleton writer passes its read_acc -> umi map
+        # directly rather than building a second copy of the keys
+        assert [a for a, *_ in iter_fastq_records(src, {"1:30|ccc": "UMI"})] == ["1:30|ccc"]
+
+        # LAZINESS, which the singleton writer's `wanted.pop(acc)` relies on: mutating `want`
+        # between yields takes effect, so a read_acc already emitted cannot be emitted twice.
+        dup = d / "dup.fq"
+        dup.write_text("@1:10|aaa\nACGT\n+\nIIII\n@1:10|aaa\nTTTT\n+\nJJJJ\n")
+        live = {"1:10|aaa": "UMI"}
+        emitted = []
+        for acc, _t, seq, _q in iter_fastq_records(dup, live):
+            if live.pop(acc, None) is None:
+                continue
+            emitted.append(seq)
+        assert emitted == ["ACGT"], emitted     # the second copy is skipped, not double-written
+
+        # a truncated file is fatal even when nothing is wanted -- the check precedes the filter
+        trunc_all = d / "truncall.fq"
+        trunc_all.write_text("@1:99|zzz\nACGT\n+\n")
+        try:
+            list(iter_fastq_records(trunc_all, {"nothing"}))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("a truncated record must be fatal even for an unwanted read")
+
+        # ------------------------------------------------------------------ #
         # the invariants must be LOUD, not silently tolerated
         # ------------------------------------------------------------------ #
         bad_len = d / "badlen.fq"
@@ -182,8 +247,9 @@ def _selftest() -> None:
         else:
             raise AssertionError("a seq/qual length mismatch must be fatal on WRITE")
 
-    print("[INFO] fastq_io selftest OK  (4-line parsing, strand-only tail, round-trip, and the "
-          "seq/qual + truncation invariants verified)")
+    print("[INFO] fastq_io selftest OK  (4-line parsing, strand-only tail, round-trip, the "
+          "streaming iterator incl. laziness, and the seq/qual + truncation invariants "
+          "verified)")
 
 
 if __name__ == "__main__":

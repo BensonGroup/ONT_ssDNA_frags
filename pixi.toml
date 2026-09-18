@@ -29,6 +29,8 @@ biopython = "*"
 pandas = "*"
 polars = "*"            # columnar engine for the Parquet frags store + per-read feature counts
 matplotlib-base = "*"   # feature-count report figures (no Qt backend needed)
+scipy = "*"             # pearsonr/spearmanr in scripts/coverage_length_corr.py. It was already
+                        # present transitively; declared so the env cannot lose it silently.
 seaborn = "*"           # heatmaps / grouped bars in the feature-count report
 plotly = "*"            # interactive feature-count reports (build_featurecount_report[_cross].py)
 regex = ">=2026.6.28,<2027"
@@ -55,6 +57,12 @@ python = "3.12.*"        # explicit: no-default-feature drops the root [dependen
 parasail-python = "*"    # import parasail
 python-edlib = "*"       # import edlib  (aarch64-only name for conda's edlib)
 spoa = "*"
+# Centroid picker for the consensus draft (`vsearch --cluster_fast --centroids --sizeout`).
+# USEARCH, which the upstream protocol uses, is a closed-source x86-only binary with no
+# linux-aarch64 build and no bioconda package; vsearch is the drop-in equivalent. This was
+# MISSING from the env even though scripts/umi_consensus.py lists it in REQUIRED_BINARIES --
+# that analysis was run on another host and its results rsynced in, so the gap went unnoticed.
+vsearch = "*"
 racon = "*"
 medaka = "*"
 minimap2 = "*"
@@ -101,12 +109,17 @@ rust = "*"
 [feature.snakemake.dependencies]
 snakemake-minimal = "*"
 
+# Extend the normal Pixi command with workflow options; the launcher calls
+# python -m snakemake, so this task does not invoke itself.
+[feature.snakemake.tasks]
+snakemake = 'python "$PIXI_PROJECT_ROOT/workflow/run.py"'
+
 # ---------------------------------------------------------------------------
 # Environments
 # ---------------------------------------------------------------------------
 [environments]
 default = ["qc", "umi", "align"]
 preprocess = { features = ["preprocess"], no-default-feature = true }
-consensus = { features = ["consensus"], no-default-feature = true }
+consensus = { features = ["umi", "consensus"], no-default-feature = true }
 build = { features = ["build"], no-default-feature = true }
 snakemake = { features = ["snakemake"], no-default-feature = true }

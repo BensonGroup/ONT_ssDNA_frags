@@ -1,7 +1,7 @@
 # ONT ligated-DNA selection-screen workflow
 
 A Snakemake workflow for the Nanopore ligated-DNA selection screen: genomic depletion → primer-HMM
-training → pychopper preprocessing → cONcat (new) decode → drops reads the decoder barely explained with min_coverage → per-read feature counts. One UMI (QC-filter → ed≤1 correct → jackpot-clean by initial library; not deduplicated) feeds three readouts: per-fragment counts, effective complexity, and fragment-vector quantification. At each step, a html report will be generated. The fitness calculation is defined outside snakemake, as it should be considered per study design. Here it's the log2(exp/emp) at last round.
+training → pychopper preprocessing → cONcat (new) decode → drops reads the decoder barely explained with min_coverage → per-read feature counts. One UMI (QC-filter → ed≤1 correct → jackpot-clean by initial library; not deduplicated) feeds three readouts: per-fragment counts, effective complexity, and fragment-vector quantification. At each step, a html report will be generated. static plots will be generated with static_plot: true in config. The fitness calculation is defined outside snakemake, as it should be considered per study design. Here it's the log2(exp/emp) at last round.
 
 ## Usage
 
@@ -39,6 +39,7 @@ Then in this repo root:
    alias concatsmk='pixi run -e snakemake snakemake'   # convenience prefix, once per shell
    concatsmk --version
    ```
+
 
 ## Your project directory and config
 
@@ -282,6 +283,79 @@ library lives in `umi_initial/`. With `jackpot.enabled: false` it is `umicorr` i
 | `<tree>/<sample>/<sample>.featurecount_report.html`                                                           | per-sample interactive report                                                |
 | `<tree>/cross_sample_featurecount_report.html`                                                                | cross-sample comparison report                                               |
 
-The initial library lands in a **separate** `*_initial/` tree so the cross report's `<tree>/*/`
-sample discovery never double-counts it; it is wired in as the shared R0 baseline via
-`report.r0_baseline: true`.
+## Standalone per-study analyses (`scripts/`, outside the DAG)
+
+The pipeline above is frozen. Everything that depends on a particular study's design — fitness,
+clone dominance, consensus — lives in `scripts/` as argparse-defaulted scripts you run by hand.
+They only ever **read** `results/`; none of them is a Snakemake rule, and none mutates an existing
+tree. Shared logic is factored out so two scripts cannot disagree about it: `fastq_io.py` (the one
+FASTQ reader/writer), `fitness_lib.py`, `consensus_lib.py` (the one consensus engine).
+
+| Script | What it produces |
+| --- | --- |
+| `fitness_step_ratios.py` | `results/fitness/<subject>_vs_<control>.log2_step_ratios.tsv` — per-round empty-corrected log2 steps plus their row sum `log2_sum`, the enrichment score |
+| `top_vector_reads.py` | reads of the top fitness **vectors**, last round → `results/fitness/top_reads/` |
+| `clonotype_clone_ranks.py`, `clone_top_reads.py` | dominant **clones** and their reads → `results/clonerank/` |
+| `umi_consensus.py` | one consensus per `(sample, umi)` for those dominant clones |
+| `all_umi_consensus.py` | **the study-wide UMI → consensus dictionary** (below) |
+| `coverage_length_corr.py` | read length vs decode coverage, per sample → `coverage_length/` (3 TSVs + a 4-panel correlation figure and a length-distribution figure) |
+
+### `all_umi_consensus.py` → `results/umi_consensus/all_umi_consensus.fa`
+
+One polished sequence per UMI, with that UMI's reads pooled across **every sample and round**, not
+per sample. It keys on `umi/<sample>/<sample>.fused.parquet` (`fused_seq_corrected`, i.e. the clean
+end of the UMI spine — all kept reads, not just the fragment-vector-bearing ones) and joins to the
+decode FASTQs on `read_acc` for sequence + quality.
+
+Pooling study-wide is the point: about two thirds of the UMIs with ≥3 reads appear in more than one
+group, and with ~3.9M UMIs in a 4^20 space chance collisions would number about five in total — so
+those are PCR copies of one construct and their reads are replicates of one sequence. The
+`<group>.umi_consensus.fa` files are **subsets** of that single dictionary (same sequence, plus a
+`group_reads=` field), not independent computations.
+
+Most UMIs are singletons — 3,877,419 distinct UMIs behind 4,002,259 reads, 98% of them seen once —
+so `--min-reads` (default 3) is what makes "all UMIs" a tractable *consensus* set. It is the lower
+edge of a **window** whose upper edge is `--max-reads`, so successive runs tile the read-count axis
+without ever re-polishing a UMI that is already done. Note that UMIs outside the window get **no**
+row in `consensus_summary.tsv`: they are dropped by a semi-join before any job exists, so
+`skipped_low_reads` never appears there. The three passes below partition the study exactly —
+16,671 + 59,958 + 3,800,790 = 3,877,419 UMIs, and 81,553 + 119,916 + 3,800,790 = 4,002,259 reads.
+The engine is `consensus_lib`'s, shared with `umi_consensus.py`:
+centroid (`vsearch`) → 4× `racon` → 1× `medaka`, same parameters. It is CPU, process-parallel over
+UMIs — each group is a ≤292 nt draft with a handful of reads, so the cost is process/model startup,
+not arithmetic, and medaka's torch in the `consensus` env is CPU-only anyway.
+
+```bash
+pixi install -e consensus                     # `vsearch` was missing from this env before
+pixi run -e consensus python scripts/all_umi_consensus.py --dry-run   # inventory, no tools run
+setsid nohup pixi run -e consensus python scripts/all_umi_consensus.py \
+  --jobs 10 --threads 2 > .claude/scratch/all_umi_consensus.log 2>&1 < /dev/null &
+```
+
+Add `--no-medaka` for a ~10× faster racon-level pass (labelled `status=racon_only`), and
+`--keep-work all` when debugging a single `--only-umi`.
+
+To extend a finished run to the UMIs it excluded, without recomputing it:
+
+```bash
+# the 2-read UMIs only. A NEW --out-dir is required: consensus_summary.tsv,
+# all_umi_consensus.fa and <group>.umi_consensus.fa are all opened "w", and the stale-group
+# pruner unlinks group files the current run does not produce.
+setsid nohup pixi run -e consensus python scripts/all_umi_consensus.py \
+  --min-reads 2 --max-reads 2 --out-dir results/umi_consensus_n2 --jobs 10 --threads 2 \
+  > .claude/scratch/all_umi_n2.log 2>&1 < /dev/null &
+
+# the 3,800,790 singletons: the raw read, verbatim, labelled `status=singleton`. Invokes no
+# external binary and makes no work dir, so it runs in ~1 min alongside the consensus run.
+pixi run -e consensus python scripts/all_umi_consensus.py \
+  --emit-singletons --out-dir results/umi_singletons
+
+# one dictionary out of the passes, de-duplicated on umi=, with a report of what is STILL missing
+pixi run -e consensus python scripts/all_umi_consensus.py \
+  --merge-from results/umi_consensus results/umi_consensus_n2 results/umi_singletons \
+  --merge-out results/umi_dictionary/complete_umi_dictionary.fa
+```
+
+`complete_umi_dictionary.fa` (~1.6 GB) is the artifact downstream analyses join against;
+`results/umi_consensus*/all_umi_consensus.fa` remains the small consensus-only dictionary. A
+singleton is a *sequence*, not a consensus — filter on `status=singleton`, never on `n_reads`.
