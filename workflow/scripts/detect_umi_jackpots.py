@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Per-study UMI/clonotype "jackpot" outlier detector for the initial (R0) library.
+"""Per-study UMI/fragvec "jackpot" outlier detector for the initial (R0) library.
 
 DETECTION IS NAIVE-LIBRARY ONLY. A collapsed reads/UMI ratio is an artefact signal ONLY in the naive
-INITIAL library: there every construct starts at comparable abundance, so a clonotype whose reads
+INITIAL library: there every construct starts at comparable abundance, so a fragvec whose reads
 pile onto ~one UMI can only be an amplification/synthesis artefact. In a post-selection round a
 genuinely enriched winner ALSO has a high reads/UMI ratio, so detecting there would wrongly flag
 real hits. That asymmetry is why the stage is fan-in/fan-out -- detect once on R0, apply the
@@ -15,16 +15,16 @@ ALREADY IN the pool. It does NOT catch a jackpot generated inside a bottlenecked
 clean behaviour here does not license assuming a bottlenecked sample's high-count lineages are
 bias-free (clarification.md).
 
-A *jackpot* is a clonotype (fragment `vector`) whose reads collapse onto very few UMIs: thousands of
+A *jackpot* is a fragvec (fragment `vector`) whose reads collapse onto very few UMIs: thousands of
 physical copies of one construct whose UMI slot failed to randomise, so they pile onto ~one barcode.
 Ranked by raw abundance it looks like a top hit; behaviourally it is an amplification/synthesis
 artefact, not a selection winner or a generic PCR winner.
 
-THE SIGNAL IS THE PIPELINE'S OWN. Per clonotype: `n_reads, n_umis, max_reads_per_umi` -- the two-axis
+THE SIGNAL IS THE PIPELINE'S OWN. Per fragvec: `n_reads, n_umis, max_reads_per_umi` -- the two-axis
 readout build_fragvec exists to produce, whose docstring calls `max_reads_per_umi` "the jackpot
 detector". This does not invent a statistic; it applies a behavioural, design-independent cut:
 
-    ratio      = n_reads / n_umis            (reads per independent clone)
+    ratio      = n_reads / n_umis            (reads per independent UMI)
     dominance  = max_reads_per_umi / n_reads (fraction carried by the single top UMI)
     FLAG  <=>  n_reads >= --min-reads  AND  ratio > --ratio-max
 
@@ -34,18 +34,18 @@ depend on fragvec and forced this whole step downstream of the branch it cleans;
 a post-hoc retro-fit rather than a stage.
 
 `ratio_max = 10` is cited: longread_umi `BIN_CLUSTER_RATIO=10` (Karst et al., Nat Methods 2021). A
-data-driven robust cut -- median + k*MAD of log10(ratio) over signal-carrying clonotypes -- is
+data-driven robust cut -- median + k*MAD of log10(ratio) over signal-carrying fragvecs -- is
 computed and REPORTED for transparency, but the action stays the cited threshold.
 
-On NB01 (3,624 clonotypes with n_reads>=10) the ratio has p50=1.12, p99=1.57, then a huge gap to the
-artefact at 48.7; `ratio>10` flags exactly 3 clonotypes and correctly ignores the abundant-but-diverse
+On NB01 (3,624 fragvecs with n_reads>=10) the ratio has p50=1.12, p99=1.57, then a huge gap to the
+artefact at 48.7; `ratio>10` flags exactly 3 fragvecs and correctly ignores the abundant-but-diverse
 aptamer loop (19,601 reads / 18,214 UMIs, ratio 1.08).
 
 This is a FILTER, not a deduplication: it names an audited set of artefact barcodes. High-count
 lineages are the signal here and are never collapsed (clarification.md:667).
 
 DELIVERABLES (into --out-dir):
-    <S>.umi_blacklist.tsv           one row per (flagged clonotype, UMI) where the UMI's OWN
+    <S>.umi_blacklist.tsv           one row per (flagged fragvec, UMI) where the UMI's OWN
                                     n_reads >= --min-reads -- the dominant artefact barcode and its
                                     larger frame-shift variants, not singletons.
     <S>.umi_blacklist_summary.tsv   thresholds, counts, robust cut, ratio percentiles, tool
@@ -124,12 +124,12 @@ def _n_distinct_bases(seq: str) -> int:
 
 # --------------------------------------------------------------------------- IO
 def load_clonotypes(frags_pq: Path, fused_pq: Path, umis_pq: Path, min_reads: int):
-    """(counts, clones) for the R0 library, built from its CORRECTED tree.
+    """(counts, UMIs) for the R0 library, built from its CORRECTED tree.
 
     This used to read `fragvec_initial/*.fragvec_counts.parquet`, which made detection depend on
     fragvec -- and therefore forced the jackpot step DOWNSTREAM of the branch it is meant to clean.
-    The clonotype table is now built here, from the same (fragments, fused) pair umi_correct emits,
-    via fragvec_lib -- the same code build_fragvec uses, so the ratio a clonotype is flagged on and
+    The fragvec table is now built here, from the same (fragments, fused) pair umi_correct emits,
+    via fragvec_lib -- the same code build_fragvec uses, so the ratio a fragvec is flagged on and
     the counts fragvec later reports cannot drift.
     """
     anc_ids = fvl.anchor_ids(anchor_set(umis_pq))
@@ -151,7 +151,7 @@ def detect(counts: pl.DataFrame, min_reads: int, ratio_max: float, robust_k: flo
 
     Returns (flagged_df, stats). `flagged_df` carries ratio/dominance and is sorted
     deterministically (ratio desc, then vector). `stats` holds the robust cut, percentiles and
-    signal-clonotype count for the summary + reports.
+    signal-fragvec count for the summary + reports.
     """
     d = counts.with_columns(
         (pl.col("n_reads") / pl.col("n_umis")).alias("ratio"),
@@ -181,7 +181,7 @@ def detect(counts: pl.DataFrame, min_reads: int, ratio_max: float, robust_k: flo
 
 def build_blacklist(flagged: pl.DataFrame, clones: pl.DataFrame, min_reads: int,
                     ratio_max: float) -> pl.DataFrame:
-    """One row per (flagged clonotype, UMI) where the UMI's OWN n_reads >= min_reads.
+    """One row per (flagged fragvec, UMI) where the UMI's OWN n_reads >= min_reads.
 
     That captures the dominant artefact barcode and its larger frame-shift variants while
     excluding singletons. Composition columns are annotations only. Stable deterministic sort:
@@ -197,7 +197,7 @@ def build_blacklist(flagged: pl.DataFrame, clones: pl.DataFrame, min_reads: int,
     rows = []
     reason = f"jackpot: reads collapse onto few UMIs (ratio>{ratio_max:g})"
     threshold = f"n_reads>={min_reads} & ratio>{ratio_max:g}"
-    method = f"{TOOL} v{VERSION}: ratio=n_reads/n_umis (build_fragvec clonotype); cited BIN_CLUSTER_RATIO"
+    method = f"{TOOL} v{VERSION}: ratio=n_reads/n_umis (build_fragvec fragvec); cited BIN_CLUSTER_RATIO"
     for r in bl.iter_rows(named=True):
         u = r["umi"]
         rows.append({
@@ -267,19 +267,19 @@ def flagged_clonotype_table(flagged: pl.DataFrame):
         f"<td class='num'>{r['dominance']:.3f}</td>"
         f"<td class='num'>{r['rpm']:,.1f}</td></tr>"
         for r in flagged.iter_rows(named=True))
-    return ("<div style='overflow-x:auto'><table><thead><tr><th>clonotype (vector)</th>"
+    return ("<div style='overflow-x:auto'><table><thead><tr><th>fragvec (vector)</th>"
             "<th>n_reads</th><th>n_umis</th><th>max_reads_per_umi</th><th>ratio</th>"
             "<th>dominance</th><th>rpm</th></tr></thead>"
             f"<tbody>{body}</tbody></table></div>")
 
 
 def fig_scatter(d: pl.DataFrame, flagged: pl.DataFrame, ratio_max, robust_cut, min_reads):
-    """ratio (y, log) vs n_reads (x, log) over ALL clonotypes; flagged jackpots highlighted."""
+    """ratio (y, log) vs n_reads (x, log) over ALL fragvecs; flagged jackpots highlighted."""
     healthy = d.join(flagged.select("vector"), on="vector", how="anti")
     fig = go.Figure()
     fig.add_trace(go.Scattergl(
         x=healthy["n_reads"].to_list(), y=healthy["ratio"].to_list(), mode="markers",
-        name="clonotypes", marker=dict(size=4, opacity=0.35, color=GREY),
+        name="fragvecs", marker=dict(size=4, opacity=0.35, color=GREY),
         hovertemplate="reads %{x}<br>ratio %{y:.2f}<extra></extra>"))
     fig.add_trace(go.Scatter(
         x=flagged["n_reads"].to_list(), y=flagged["ratio"].to_list(), mode="markers",
@@ -294,9 +294,9 @@ def fig_scatter(d: pl.DataFrame, flagged: pl.DataFrame, ratio_max, robust_cut, m
                       annotation_text=f"robust cut = {robust_cut:.2f}", annotation_position="bottom left")
     fig.add_vline(x=min_reads, line=dict(color=GREY, dash="dot"), opacity=0.5)
     fig.update_xaxes(type="log", title="n_reads  (abundance)")
-    fig.update_yaxes(type="log", title="ratio = n_reads / n_umis  (reads per independent clone)")
+    fig.update_yaxes(type="log", title="ratio = n_reads / n_umis  (reads per independent UMI)")
     return fig_html(style(fig, 520,
-        "Reads-per-clone vs abundance — the flagged jackpots sit alone in the top-right corner, "
+        "Reads-per-UMI vs abundance — the flagged jackpots sit alone in the top-right corner, "
         "orders of magnitude above the healthy population"))
 
 
@@ -339,8 +339,8 @@ def flagged_umi_table(blacklist: pl.DataFrame):
         for r in blacklist.iter_rows(named=True))
     return ("<div style='overflow-x:auto'><table><thead><tr><th>UMI (barcode)</th>"
             "<th>family reads</th><th>homopolymer_maxrun</th><th>n_distinct_bases</th>"
-            "<th>base_entropy_bits</th><th>clonotype ratio</th><th>dominance</th>"
-            "<th>clonotype</th></tr></thead>"
+            "<th>base_entropy_bits</th><th>fragvec ratio</th><th>dominance</th>"
+            "<th>fragvec</th></tr></thead>"
             f"<tbody>{body}</tbody></table></div>")
 
 
@@ -348,25 +348,25 @@ def flagged_umi_table(blacklist: pl.DataFrame):
 def write_fragvec_report(out: Path, sample, d, flagged, stats, ratio_max, min_reads):
     H = _head(f"{sample} — fragvec jackpot report")
     H += [
-        f"<h1>{esc(sample)} — fragment-vector jackpot report</h1>",
-        "<p class='small'>Behavioural, design-independent detector: a clonotype is flagged as a "
+        f"<h1>{esc(sample)} — fragvec jackpot report</h1>",
+        "<p class='small'>Behavioural, design-independent detector: a fragvec is flagged as a "
         f"<b>jackpot</b> when it has ≥{min_reads} reads AND <code>ratio = n_reads/n_umis &gt; "
         f"{ratio_max:g}</code> (its reads collapse onto very few independent UMIs). "
         f"<code>ratio_max={ratio_max:g}</code> is cited (longread_umi <code>BIN_CLUSTER_RATIO</code>, "
         "Karst et al. Nat Methods 2021). This is workflow QC, not a biological claim.</p>",
-        f"<p class='small'>Over {stats['n_signal']:,} signal-carrying clonotypes "
+        f"<p class='small'>Over {stats['n_signal']:,} signal-carrying fragvecs "
         f"(n_reads≥{min_reads}) the ratio has p50={stats['ratio_p50']:.2f}, "
         f"p90={stats['ratio_p90']:.2f}, p99={stats['ratio_p99']:.2f}, then a gap to the flagged "
         f"outliers. The data-driven robust cut (median + k·MAD on log10 ratio) is "
         f"{stats['robust_cut_ratio']:.2f}; the default action uses the cited {ratio_max:g}.</p>",
-        "<h2>Reads-per-clone vs abundance</h2>",
+        "<h2>Reads-per-UMI vs abundance</h2>",
         fig_scatter(d, flagged, ratio_max, stats["robust_cut_ratio"], min_reads),
-        f"<h2>Flagged clonotypes ({flagged.height})</h2>",
+        f"<h2>Flagged fragvecs ({flagged.height})</h2>",
         flagged_clonotype_table(flagged),
         "<h2>What this does and does not license</h2>",
         "<p class='small'>Detection runs on the <b>naive R0 library only</b>, and the blacklist is "
         "applied to every round. That asymmetry is forced: post-selection, a genuinely enriched "
-        "winner <i>also</i> collapses its reads onto few clones, so the ratio no longer separates "
+        "winner <i>also</i> collapses its reads onto few UMIs, so the ratio no longer separates "
         "an artefact from a hit — detecting there would blacklist true winners.</p>",
         "<p class='small'>The converse limit is worth stating plainly: jackpotting is worst when "
         "<b>few templates enter the PCR</b>, so the R0 library is the <i>least</i> susceptible "
@@ -385,12 +385,12 @@ def write_umi_report(out: Path, sample, blacklist, clones, flagged, stats, min_r
     H = _head(f"{sample} — umi jackpot report")
     H += [
         f"<h1>{esc(sample)} — UMI jackpot report</h1>",
-        "<p class='small'>The UMIs blacklisted from the flagged clonotypes: for each flagged "
-        f"clonotype, the barcodes whose own read count is ≥{min_reads} (the dominant artefact "
+        "<p class='small'>The UMIs blacklisted from the flagged fragvecs: for each flagged "
+        f"fragvec, the barcodes whose own read count is ≥{min_reads} (the dominant artefact "
         "barcode plus its larger frame-shift variants, not singletons). Composition columns "
         "(homopolymer run, distinct bases, base Shannon entropy in bits) are <b>annotations only</b>, "
         "never filter drivers.</p>",
-        f"<p class='small'>{blacklist.height} UMI rows across {flagged.height} flagged clonotypes. "
+        f"<p class='small'>{blacklist.height} UMI rows across {flagged.height} flagged fragvecs. "
         "Downstream analyses exclude these barcode sequences from later rounds (which cannot "
         "UMI-dedup but can still read the UMI), removing the artefact's reads while preserving "
         "legitimate reads that share the same fragment layout.</p>",
@@ -447,9 +447,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out-dir", required=True, type=Path,
                     help="output dir for the blacklist, its summary and the two audit reports")
     ap.add_argument("--min-reads", type=int, default=10,
-                    help="signal floor. MUST equal fragvec.min_reads: the clone table is "
+                    help="signal floor. MUST equal fragvec.min_reads: the UMI table is "
                          "restricted by that same floor, so a lower one here would flag "
-                         "clonotypes whose UMIs are absent from it and drop them silently")
+                         "fragvecs whose UMIs are absent from it and drop them silently")
     ap.add_argument("--ratio-max", type=float, default=10.0,
                     help="flag if n_reads/n_umis exceeds this (default 10, cited)")
     ap.add_argument("--robust-k", type=float, default=5.0,
@@ -493,7 +493,7 @@ def main(argv: list[str]) -> int:
 
     rc = stats["robust_cut_ratio"]
     rc_s = f"{rc:.2f}" if rc == rc and math.isfinite(rc) else "n/a"
-    print(f"[jackpot] {args.sample}: {stats['n_signal']:,} signal clonotypes, "
+    print(f"[jackpot] {args.sample}: {stats['n_signal']:,} signal fragvecs, "
           f"{stats['n_flagged']} flagged, {blacklist.height} blacklist rows "
           f"(reported robust cut {rc_s}; action = cited ratio_max {args.ratio_max:g})")
     for label, q in (("blacklist", bl_out), ("summary", sum_out),
