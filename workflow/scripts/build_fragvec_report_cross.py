@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # is the symmetric follow-up; the UMI branch is where the C_eff work landed first.
 from complexity_lib import c_eff, rarefy   # depth-robust complexity; see complexity_lib docstring
 from report_lib import (
-    BASELINE_GROUP, GREY, color_key_html, esc, fig_html, first_of_group, group_color, load_meta,
+    BASELINE_GROUP, GREY, Look, PlotStyle, color_key_html, esc, fig_html, intersections, load_meta,
 )
 
 BASE = Path(os.environ.get("L2F_BASE", "")).resolve()
@@ -48,12 +48,16 @@ SAMPLES_TSV = os.environ.get("L2F_SAMPLES", "").strip()
 MIN_READS = int(os.environ.get("L2F_MIN_READS", "10"))
 OUT = BASE / "fragvec_report_cross.html"
 
-# Colours the top-N VECTORS in fig_trajectories -- one hue per vector, indexed by rank. That is a
-# different axis from the group palette and must stay a separate list. Do not "fix" it to
-# group_color(): the trajectory panel is already per-group, and inside it the thing being told apart
-# is the vector, not the sample.
+# Colours the top-N VECTORS in fig_trajectories, indexed by rank; past 8 vectors the hues repeat with
+# the next line dash, so (colour, dash) names exactly one vector. That is a different axis from the
+# group palette and must stay a separate list. Do not "fix" it to the group colours: the trajectory
+# panel is already per-group, and inside it the thing being told apart is the vector, not the sample.
 VECTOR_PALETTE = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2",
                   "#EECA3B", "#B279A2", "#FF9DA6"]
+
+
+#: Sample identity (report_lib.PlotStyle), set by main() from the config table.
+PSTYLE: PlotStyle
 
 
 def style(fig, height, title=None, top=None):
@@ -68,7 +72,9 @@ def style(fig, height, title=None, top=None):
         # 64 = title band (~28) + one legend row (~19) + slack. The old 50 left the title's
         # descender sitting on the legend's top edge; `top` buys more for a multi-row legend.
         margin=dict(l=60, r=20, t=(top or (64 if title else 20)), b=50),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), font=dict(size=12))
+        font=dict(size=12), hoverlabel=dict(namelength=-1))
+    if fig.layout.legend.orientation is None:       # keep a per-sample legend PlotStyle placed
+        fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
     return fig
 
 
@@ -144,15 +150,22 @@ def fig_collapse(samples, counts, gcol):
     ce = [c_eff(vecs[n])[3] for n in names]
 
     colors = [gcol.get(s["group"], GREY) for s in samples]
+    labels = [PSTYLE[s].label for s in samples]
     fig = go.Figure()
     fig.add_trace(go.Bar(x=names, y=rar, name=f"distinct vectors, RAREFIED to {m:,} reads",
-                         marker=dict(color=colors)))
+                         marker=dict(color=colors), customdata=labels,
+                         hovertemplate="%{customdata}<br>%{y:,.0f} vectors at "
+                                       f"{m:,} reads<extra></extra>"))
     fig.add_trace(go.Bar(x=names, y=raw, name="raw distinct vectors (DEPTH-DEPENDENT — do not compare)",
                          marker=dict(color=colors, opacity=0.35,
-                                     pattern=dict(shape="/", solidity=0.35))))
+                                     pattern=dict(shape="/", solidity=0.35)), customdata=labels,
+                         hovertemplate="%{customdata}<br>%{y:,} raw distinct vectors<extra></extra>"))
     fig.add_trace(go.Scatter(x=names, y=ce, name="c_eff (depth-robust)", yaxis="y2",
                              mode="lines+markers", line=dict(color=GREY, width=2, dash="dot"),
-                             marker=dict(size=7, color=colors)))
+                             marker=dict(size=8, color=colors,
+                                         symbol=[PSTYLE.symbol(s["group"]) for s in samples]),
+                             customdata=labels,
+                             hovertemplate="%{customdata}<br>c_eff %{y:,.0f}<extra></extra>"))
     fig.update_layout(barmode="group",
                       yaxis=dict(title="distinct fragvecs"),
                       yaxis2=dict(title="c_eff", overlaying="y", side="right", type="log"))
@@ -181,7 +194,8 @@ def fig_anchor_only(samples, summ, gcol):
     if not names:
         return ""
     fig = go.Figure(go.Bar(x=names, y=pct, marker=dict(color=colors),
-                           hovertemplate="%{y:.1f}% anchor-only<extra></extra>"))
+                           customdata=[PSTYLE[n].label for n in names],
+                           hovertemplate="%{customdata}<br>%{y:.1f}% anchor-only<extra></extra>"))
     fig.update_yaxes(title="% of decoded reads with NO fragment")
     return ("<h3>Anchor-only reads (dropped)</h3><p class='small'>Reads carrying a valid UMI and both "
             "backbone anchors but <b>no fragment</b> — they decode no ligand, so they are "
@@ -191,23 +205,23 @@ def fig_anchor_only(samples, summ, gcol):
 
 
 def fig_incidence(samples, counts, gcol):
-    """n_umis (independent UMIs) vs n_reads. Diagonal = trustworthy; far below = jackpot."""
-    fig = go.Figure()
-    for s, first in zip(samples, first_of_group(samples)):
+    """n_umis (independent UMIs) vs n_reads. Diagonal = trustworthy; far below = jackpot.
+
+    One legend entry per sample (group colour + shape); split into one panel per group when one
+    panel would hold too many samples. Hover names the sample in full."""
+    def cloud(s):
         df = counts[s["name"]].filter(pl.col("n_reads") >= MIN_READS)
-        if df.height == 0:
-            continue
-        fig.add_trace(go.Scattergl(
-            x=df["n_reads"].to_list(), y=df["n_umis"].to_list(), mode="markers",
-            name=esc(s["group"]), legendgroup=s["group"], showlegend=first,
-            marker=dict(size=4, opacity=0.45, color=gcol.get(s["group"], GREY)),
-            hovertemplate="reads %{x}<br>UMIs %{y}<extra>" + esc(s["name"]) + "</extra>"))
+        return ((df["n_reads"].to_list(), df["n_umis"].to_list(), "reads %{x}<br>UMIs %{y}")
+                if df.height else None)
+
+    fig = PSTYLE.curves(samples, cloud, mode="markers", size=4, height=520, gl=True, opacity=0.45)
     lo, hi = MIN_READS, max((int(counts[s["name"]]["n_reads"].max() or 1)) for s in samples)
     fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="1 read / UMI",
-                             line=dict(color=GREY, dash="dash")))
-    fig.update_xaxes(type="log", title="n_reads  (abundance)")
-    fig.update_yaxes(type="log", title="n_umis  (incidence — independent UMIs)")
-    return fig_html(style(fig, 520,
+                             legendgroup="ref", line=dict(color=GREY, dash="dash"),
+                             hoverinfo="skip"), row="all", col="all")    # in every panel
+    fig.update_xaxes(type="log", title_text="n_reads  (abundance)")
+    fig.update_yaxes(type="log", title_text="n_umis  (incidence — independent UMIs)")
+    return fig_html(style(fig, fig.layout.height,
         "Incidence vs abundance — on the dashed line = many independent UMIs (trustworthy); "
         "far below = few UMIs carrying many reads (jackpot)"))
 
@@ -223,7 +237,8 @@ def jackpot_table(samples, counts, top=25):
     if not rows:
         return "<p class='small'>No jackpot vectors (every vector above threshold rests on ≥3 UMIs).</p>"
     body = "".join(
-        f"<tr><td>{esc(a)}</td><td style='font-family:monospace;font-size:.75rem'>{esc(b[:70])}"
+        f"<tr><td>{esc(a)}</td><td style='font-family:monospace;font-size:.75rem' "
+        f"title='{esc(b)}'>{esc(b[:70])}"
         f"{'…' if len(b) > 70 else ''}</td><td class='num'>{c:,}</td><td class='num'>{d}</td>"
         f"<td class='num'>{e:,}</td></tr>" for a, b, c, d, e in rows[:top])
     return (f"<h3>Jackpot flags</h3><p class='small'>Vectors with ≥{MIN_READS} reads but ≤2 UMIs — "
@@ -259,13 +274,16 @@ def fig_trajectories(group, longp, top=15):
         m = dict(zip(sub["sample"].to_list(), zip(sub["rpm"].to_list(), sub["n_reads"].to_list())))
         ys = [m.get(s, (0, 0))[0] for s in order]
         nr = [m.get(s, (0, 0))[1] for s in order]
+        lk = Look(name=v, group="", round=None, shape=0,
+                  color=VECTOR_PALETTE[i % len(VECTOR_PALETTE)], dash=i // len(VECTOR_PALETTE))
+        kw = lk.trace("lines+markers")
+        kw.update(name=esc(v[:28]) + ("…" if len(v) > 28 else ""), legendgroup=v)  # short legend
+        kw.pop("legendgrouptitle_text")
+        kw["marker"].update(size=[9 if n >= MIN_READS else 5 for n in nr],
+                            symbol=["circle" if n >= MIN_READS else "circle-open" for n in nr])
         fig.add_trace(go.Scatter(
-            x=order, y=ys, mode="lines+markers", name=v[:28] + ("…" if len(v) > 28 else ""),
-            line=dict(color=VECTOR_PALETTE[i % len(VECTOR_PALETTE)], width=1.6),
-            marker=dict(size=[9 if n >= MIN_READS else 5 for n in nr],
-                        symbol=["circle" if n >= MIN_READS else "circle-open" for n in nr]),
-            customdata=nr,
-            hovertemplate="%{x}<br>%{y:.1f} RPM<br>%{customdata} reads<extra></extra>"))
+            x=order, y=ys, **kw, customdata=nr,       # the hover carries the FULL vector
+            hovertemplate=lk.hover("sample %{x}<br>%{y:.1f} RPM<br>%{customdata} reads")))
     fig.update_yaxes(type="log", title="reads per million fragment reads (depth-normalised)")
     # One legend entry per vector, ~4 per row at this width; the legend grows UPWARD out of the plot
     # area, so reserve its band explicitly or it swallows the title. Height stays 480 -- the plot
@@ -274,6 +292,22 @@ def fig_trajectories(group, longp, top=15):
     return fig_html(style(fig, 480,
         f"{esc(group)} — top {len(tops)} vectors at {esc(order[-1])} (open markers = below "
         f"{MIN_READS} reads: noise)", top=34 + 19 * rows + 10))
+
+
+def fig_upset(group, samples, counts, top_n=24):
+    """Vectors shared across ONE selection's samples (R0 first, then its rounds). A vector is IN a
+    sample when it has >= MIN_READS reads there -- the same cut that flags `is_noise` -- so one-read
+    vectors, which are mostly sampling noise, do not swamp the intersections."""
+    base = [s for s in samples if s["is_baseline"]]
+    members = base + [s for s in samples if s["group"] == group and not s["is_baseline"]]
+    sets = {s["name"]: counts[s["name"]].filter(pl.col("n_reads") >= MIN_READS)["vector"].to_list()
+            for s in members}
+    if not any(sets.values()):
+        return f"<p class='small'>No vectors with ≥{MIN_READS} reads in {esc(group)}.</p>"
+    fig = PSTYLE.upset(sets, group, top_n=top_n)
+    n = min(top_n, len(intersections(sets)))
+    return fig_html(style(fig, None, f"{esc(group)} — vectors with ≥{MIN_READS} reads shared across rounds "
+                                     f"(top {n} intersections)"))
 
 
 def cross_arm(samples, groups):
@@ -311,7 +345,8 @@ def cross_arm(samples, groups):
     fig.update_yaxes(title="vectors")
     h = fig_html(style(fig, 380, f"Cross-arm agreement: {esc(ga)} vs {esc(gb)}"))
     body = "".join(
-        f"<tr><td style='font-family:monospace;font-size:.75rem'>{esc(v[:60])}{'…' if len(v)>60 else ''}</td>"
+        f"<tr><td style='font-family:monospace;font-size:.75rem' title='{esc(v)}'>"
+        f"{esc(v[:60])}{'…' if len(v)>60 else ''}</td>"
         f"<td class='num'>{a:,}</td><td class='num'>{b:,}</td><td class='num'>{i:,}</td>"
         f"<td class='num'>{j:.3f}</td><td>{'UMI-SHARED (weak)' if j >= 0.01 else 'UMI-INDEPENDENT (strong)'}</td></tr>"
         for v, a, b, i, j in rows[:20])
@@ -341,7 +376,9 @@ def main():
             d = pl.read_csv(s["summary"], separator="\t")
             summ[s["name"]] = d.row(0, named=True) if d.height else {}
     groups = [g for g in dict.fromkeys(s["group"] for s in samples if not s["is_baseline"])]
-    gcol = group_color(samples)     # same colour per cell line as the other two cross reports
+    global PSTYLE
+    PSTYLE = PlotStyle.of(meta, samples)   # group colour + shape, one dash per sample
+    gcol = PSTYLE.colors                   # same colour per cell line as the other two reports
 
     H = ["<!doctype html><html><head><meta charset='utf-8'>",
          "<meta name='viewport' content='width=device-width, initial-scale=1'>",
@@ -364,6 +401,11 @@ def main():
         lp = BASE / f"{g}.fragvec_x_sample.long.parquet"
         if lp.exists():
             H.append(fig_trajectories(g, lp))
+    H.append("<h2>Shared vectors across rounds</h2><p class='small'>One view per selection: R0, then its "
+             f"rounds. A vector counts as present in a sample with ≥{MIN_READS} reads (the noise cut). Each row "
+             "label gives that sample's set size — shared counts grow with the depth of every sample involved, "
+             "so read an intersection against the sizes beside it. Hover a bar for the samples sharing it.</p>")
+    H += [fig_upset(g, samples, counts) for g in groups]
     H.append(cross_arm(samples, groups))
     H.append("</body></html>")
     OUT.write_text("\n".join(x for x in H if x))

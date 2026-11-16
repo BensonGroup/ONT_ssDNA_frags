@@ -36,7 +36,7 @@ from ligand_vocab import (
 # The GROUP layer is shared with the umi/fragvec cross reports so a cell line is the same colour in
 # all three. ligand_vocab's GREY/PALETTE stay: they colour fragment CLASSES, a different axis.
 from report_lib import (
-    BASELINE_GREY, BASELINE_GROUP, color_key_html, esc, fig_html, group_color, load_meta,
+    BASELINE_GROUP, Look, PlotStyle, color_key_html, esc, fig_html, load_meta,
 )
 from report_lib import group_band as _group_band
 from report_lib import group_dividers as _group_dividers
@@ -263,7 +263,7 @@ def style(fig, height, title=None):
         margin=dict(l=10, r=10, t=40 if title else 12, b=12),
         title=(dict(text=title, x=0, xref="paper", font=dict(size=15)) if title else None),
         legend=dict(font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
-        hoverlabel=dict(font_size=12),
+        hoverlabel=dict(font_size=12, namelength=-1),
     )
     grid = dict(gridcolor="rgba(139,148,158,0.18)", zerolinecolor="rgba(139,148,158,0.35)",
                 linecolor="rgba(139,148,158,0.4)")
@@ -285,10 +285,8 @@ def group_band(fig, samples, yshift):
 
 
 def col_label(s):
-    """Full label (group + round) — used in hovers and the line-plot legends."""
-    if s.get("is_baseline"):
-        return "R0 library"
-    return f'{s["line"]} R{s["round"]}' if s["round"] is not None else s["name"]
+    """The FULL sample label for hovers: its name, then its group and round (PlotStyle's)."""
+    return PSTYLE[s].label
 
 
 def col_short(s):
@@ -478,17 +476,25 @@ def fig_trajectories(d, topn=10):
     base_name = d.get("baseline")   # shared R0 point prepended to every line, if present
     fig = make_subplots(rows=1, cols=len(lnames), shared_yaxes=True,
                         subplot_titles=[esc(x) for x in lnames], horizontal_spacing=0.04)
+    # Lines here are FEATURES, coloured by their class; several top features can share a class, so
+    # each also gets its own dash inside its class -- (colour, dash) names exactly one feature, and
+    # the legend lists them under their class, like samples under their group elsewhere.
+    looks, nth = {}, {}
+    for b in top:
+        c = feat_class(b)
+        nth[c] = nth.get(c, -1) + 1
+        looks[b] = Look(name=b, group=c, round=None, color=d["colors"].get(c, GREY), shape=0,
+                        dash=nth[c])
     for ci, ln in enumerate(lnames, start=1):
         ss = lines[ln]
         xs = ([0] if base_name else []) + [s["round"] for s in ss]
         for b in top:
             ys = ([d["per"][base_name].get(b, 0.0)] if base_name else []) + \
                  [d["per"][s["name"]].get(b, 0.0) for s in ss]
+            lk = looks[b]
             fig.add_trace(go.Scatter(
-                x=xs, y=ys, mode="lines+markers", name=b, legendgroup=b,
-                showlegend=(ci == 1), marker=dict(size=6, color=d["colors"].get(feat_class(b), GREY)),
-                line=dict(width=1.6, color=d["colors"].get(feat_class(b), GREY)),
-                hovertemplate=f"{ln} R%{{x}}<br><b>{b}</b><br>%{{y:.4f}} copies/read<extra></extra>"),
+                x=xs, y=ys, **lk.trace("lines+markers", size=6), showlegend=(ci == 1),
+                hovertemplate=lk.hover(f"{esc(ln)} R%{{x}}<br>%{{y:.4f}} copies/read")),
                 row=1, col=ci)
         fig.update_xaxes(title=("round (0 = library)" if base_name else "round"),
                          dtick=1, row=1, col=ci)
@@ -536,64 +542,33 @@ def fig_contrast(d):
 
 
 # ------------------------------------------------------------------------ multiplicity & quality
-def sample_palette(d):
-    """Sample -> its GROUP's colour (baseline grey), shared by the multiplicity/quality panels.
-
-    It used to hand every sample its own hue off ligand_vocab's PALETTE -- the same list that colours
-    fragment CLASSES elsewhere on this page, so one hue meant "class X" in the heatmap and "sample Y"
-    here. Now colour means group, everywhere, in all three cross reports. Rounds inside a group are
-    told apart by dash (sample_dash) on the line panels, and by position + the group band on the bars.
-    """
-    gcol = group_color(d["samples"], key="line")
-    return {s["name"]: (BASELINE_GREY if s.get("is_baseline")
-                        else gcol.get(s["line"], GREY)) for s in d["samples"]}
-
-
-DASHES = ["solid", "dash", "longdash", "dashdot", "longdashdot"]
-
-
-def sample_dash(s):
-    """Rounds within a group are separated by dash, since hue is now spent on the group."""
-    if s.get("is_baseline") or s["round"] is None:
-        return "dot"
-    return DASHES[(s["round"] - 1) % len(DASHES)]
+# Sample identity on this page = PlotStyle (report_lib): colour + marker shape name the GROUP, a
+# line dash names the sample inside it. Fragment-CLASS colours (ligand_vocab) are a different axis
+# and never colour a sample. Set by main() from the config table.
+PSTYLE: PlotStyle
 
 
 def fig_multiplicity(d):
-    cols = sample_palette(d)
     xs = list(range(MAXBUCKET + 1))
     labels = [str(x) for x in xs[:-1]] + [f"{MAXBUCKET}+"]
-    fig = go.Figure()
-    for s in d["samples"]:
-        nm = s["name"]
-        ys = [100 * d["ppr"][nm].get(x, 0.0) for x in xs]
-        fig.add_trace(go.Scatter(
-            x=labels, y=ys, mode="lines+markers", name=col_label(s), legendgroup=s["line"],
-            marker=dict(size=5, color=cols[nm]),
-            line=dict(width=1.6, color=cols[nm], dash=sample_dash(s)),
-            hovertemplate=f"{col_label(s)}<br>%{{x}} fragments<br>%{{y:.1f}}% of reads<extra></extra>"))
-    fig.update_xaxes(title="fragment copies in a read")
-    fig.update_yaxes(title="% of reads")
-    style(fig, height=380)
+    fig = PSTYLE.curves(d["samples"], lambda s: (
+        labels, [100 * d["ppr"][s["name"]].get(x, 0.0) for x in xs],
+        "%{x} fragments<br>%{y:.1f}% of reads"), mode="lines+markers", size=5, height=380)
+    fig.update_xaxes(title_text="fragment copies in a read")
+    fig.update_yaxes(title_text="% of reads")
+    style(fig, height=fig.layout.height)
     return fig_html(fig)
 
 
 def fig_quality(d):
-    cols = sample_palette(d)
     maxed = max((max(v) for v in d["edh"].values() if v), default=13)
     xs = list(range(maxed + 1))
-    fig = go.Figure()
-    for s in d["samples"]:
-        nm = s["name"]
-        ys = [100 * d["edh"][nm].get(x, 0.0) for x in xs]
-        fig.add_trace(go.Scatter(
-            x=xs, y=ys, mode="lines+markers", name=col_label(s), legendgroup=s["line"],
-            marker=dict(size=5, color=cols[nm]),
-            line=dict(width=1.6, color=cols[nm], dash=sample_dash(s)),
-            hovertemplate=f"{col_label(s)}<br>edit distance %{{x}}<br>%{{y:.1f}}% of calls<extra></extra>"))
-    fig.update_xaxes(title="edit distance (fragment calls)", dtick=1)
-    fig.update_yaxes(title="% of calls")
-    style(fig, height=380)
+    fig = PSTYLE.curves(d["samples"], lambda s: (
+        xs, [100 * d["edh"][s["name"]].get(x, 0.0) for x in xs],
+        "edit distance %{x}<br>%{y:.1f}% of calls"), mode="lines+markers", size=5, height=380)
+    fig.update_xaxes(title_text="edit distance (fragment calls)", dtick=1)
+    fig.update_yaxes(title_text="% of calls")
+    style(fig, height=fig.layout.height)
     return fig_html(fig)
 
 
@@ -602,12 +577,11 @@ def fig_depth(d):
 
     Filtered trees have one retained-read series. Raw decode also shows the
     fragment-bearing subset, with the same sample colours and distinct opacity."""
-    cols = sample_palette(d)
     samples = d["samples"]
     xpos = list(range(len(samples)))          # numeric x so duplicate round labels never merge bars
     xshort = [col_short(s) for s in samples]
     xfull = [col_label(s) for s in samples]
-    bar = [cols[s["name"]] for s in samples]
+    bar = [PSTYLE[s].color for s in samples]
     n_reads = [int(d["meta"][s["name"]]["n_reads"]) for s in samples]
     n_pay = [int(d["meta"][s["name"]]["n_reads_with_payload"]) for s in samples]
 
@@ -653,19 +627,13 @@ def fig_coverage(d):
 
     This is the PRE-filter distribution when the decode coverage filter ran, so the cut line below
     shows what it removed rather than an edge the data appears to stop at for no reason."""
-    cols = sample_palette(d)
     have = [s for s in d["samples"] if d["cov"].get(s["name"])]
     if not have:
         return "", []
     centers = [100 * (i + 0.5) / COVBINS for i in range(COVBINS)]
-    fig = go.Figure()
-    for s in have:
-        nm = s["name"]
-        ys = [100 * d["cov"][nm].get(i, 0.0) for i in range(COVBINS)]
-        fig.add_trace(go.Scatter(
-            x=centers, y=ys, mode="lines", name=col_label(s), legendgroup=s["line"],
-            line=dict(width=1.8, color=cols[nm], dash=sample_dash(s)),
-            hovertemplate=f"{col_label(s)}<br>~%{{x:.0f}}% covered<br>%{{y:.1f}}% of reads<extra></extra>"))
+    fig = PSTYLE.curves(have, lambda s: (
+        centers, [100 * d["cov"][s["name"]].get(i, 0.0) for i in range(COVBINS)],
+        "~%{x:.0f}% covered<br>%{y:.1f}% of reads"), width=1.8, height=380)
     if MIN_COVERAGE is not None:
         fig.add_vline(x=100 * MIN_COVERAGE, line=dict(color=GREY, width=1.2, dash="dot"),
                       annotation_text=f"filter: keep ≥ {100 * MIN_COVERAGE:.0f}%",
@@ -673,9 +641,9 @@ def fig_coverage(d):
                       annotation_font=dict(size=11, color=GREY))
     # x starts at 60: under 0.2% of any sample's reads fall below that, and the clip gives the
     # informative 60-100 region ~2.5x the width.
-    fig.update_xaxes(title="% of read length covered by expected fragments", range=[60, 100])
-    fig.update_yaxes(title="% of reads")
-    style(fig, height=380)
+    fig.update_xaxes(title_text="% of read length covered by expected fragments", range=[60, 100])
+    fig.update_yaxes(title_text="% of reads")
+    style(fig, height=fig.layout.height)
     fig.update_layout(margin=dict(t=88))      # match fig_depth's top margin so the plots align
     missing = [s["name"] for s in d["samples"] if not d["cov"].get(s["name"])]
     return fig_html(fig), missing
@@ -720,6 +688,8 @@ def main():
     baseline = load_baseline()
     if baseline:
         samples = [baseline] + samples          # R0 library first, shared across cell lines
+    global PSTYLE
+    PSTYLE = PlotStyle.of(SAMPLE_META, samples, key="line")
     d = load(samples)
     lines = sorted({s["line"] for s in samples if not s.get("is_baseline")})
     n_real = sum(1 for s in samples if not s.get("is_baseline"))
@@ -748,10 +718,12 @@ def main():
         f'<p class="subtitle">Per-read ligand-fragment profiles of {n_real} decoded samples '
         f'({esc(", ".join(lines))}){r0_note}, lined up feature-by-feature. Charts are interactive — '
         "hover for exact numbers, click legend entries to toggle classes/features, drag to zoom.</p>",
-        '<p class="small">Sample colour = the config <b>group</b> (the same colour for a cell line in '
-        "every cross report); rounds within a group are told apart by line dash. The fragment-class "
-        "colours in the legend below are a different axis — they name features, not samples.</p>",
-        color_key_html(group_color(samples, key="line"), samples, key="line"),
+        '<p class="small">Sample colour and marker shape = the config <b>group</b> (the same for a '
+        "cell line in every cross report); inside a group each sample has its own line dash and its "
+        "own legend entry, so colour + dash names exactly one sample. Hover any mark for the full "
+        "sample name. The fragment-class colours in the legend below are a different axis — they "
+        "name features, not samples.</p>",
+        color_key_html(PSTYLE.colors, samples, key="line"),
 
         '<div class="callout aim"><p><b>Aim.</b> For every ligand fragment, how does <b>mean copies '
         "per decoded read</b> shift <b>across selection rounds</b> (within a group) and "

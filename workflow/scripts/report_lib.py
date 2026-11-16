@@ -14,12 +14,13 @@ This module is TWO things, and the second one is newer and easy to miss:
    embedding, and the GROUP layer: a group is the organising dimension of every diagram, and a group
    must be the same colour in every report.
 
-HARD INVARIANT -- THIS MODULE MUST STAY STDLIB-ONLY. Because of (1) it is now imported at
+HARD INVARIANT -- THIS MODULE MUST STAY STDLIB-ONLY AT IMPORT. Because of (1) it is now imported at
 WORKFLOW-PARSE TIME by `common.smk`, i.e. under the `snakemake` pixi env, which has NO plotly and NO
 polars. Add `import plotly` (or polars, numpy, ...) at its top and THE ENTIRE WORKFLOW STOPS PARSING
 -- not one rule, all of it, before any job is scheduled. `fig_html` only calls a method on the figure
-it is handed; keep it that way. The corollary benefit: the palette self-test at the bottom runs under
-plain `python3 report_lib.py`.
+it is handed, and `PlotStyle.curves` -- the one method that builds a figure -- imports plotly inside
+its body, where only a report ever reaches it. Keep both that way. The corollary benefit: the
+palette self-test at the bottom runs under plain `python3 report_lib.py`.
 
 WHAT DOES NOT LIVE HERE: `style()` and the CSS. They only look duplicated. The featurecount report
 uses transparent backgrounds, different margins, its own axis colours, and an external CSS kit with
@@ -46,12 +47,23 @@ from pathlib import Path
 # NOT drawn from ligand_vocab.PALETTE on purpose: that list already does double duty in the
 # featurecount report for fragment CLASSES, so reusing it for groups would make the same hue mean
 # two different things on one page.
+#
+# The palette is NEVER cycled: a colour reused for a second group would make two arms read as one.
+# The last three slots were chosen by searching hue families (magenta / sky / maroon) for the set
+# whose WORST pair, over all 9 colours including the baseline grey, stays furthest apart under all
+# three vision models: min pairwise dE 16.0, every slot >= 3:1 on both report backgrounds.
+# A project with MORE groups is valid and is not rejected: group_color() extends the palette with
+# extra_colors(), each new colour the candidate furthest from every colour already in use. Those
+# extras are distinct but no longer guaranteed CVD-safe, so the legend names every group.
 GROUP_PALETTE = [
     "#0072B2",   # blue        <- A549 in the current config
     "#009E73",   # green       <- MDA
     "#D55E00",   # vermillion
     "#8250df",   # purple
     "#a86c3f",   # brown
+    "#df0cb5",   # magenta
+    "#4c94e6",   # sky blue
+    "#aa4148",   # maroon
 ]
 # The R0 / initial library: a shared baseline, NOT a selection arm. Deliberately recessive, but it
 # still has to be READABLE -- #7d8590 is the grey that clears 3:1 against both the light and the dark
@@ -175,10 +187,299 @@ def group_color(groups, key="group"):
         groups = group_order(groups, key=key)
     out = {BASELINE_GROUP: BASELINE_GREY}
     # filter here too, not only in group_order(): callers may hand us a plain list of names that
-    # still contains the baseline, and it must not shift the others by one.
-    for i, g in enumerate([g for g in groups if g != BASELINE_GROUP]):
-        out[g] = GROUP_PALETTE[i % len(GROUP_PALETTE)]
+    # still contains the baseline, and it must not shift the others by one. Deduplicated, so a list
+    # that repeats a group cannot hand one group two slots.
+    arms = [g for g in dict.fromkeys(groups) if g and g != BASELINE_GROUP]
+    extra = len(arms) - len(GROUP_PALETTE)
+    if extra > 0:
+        _warn_once(f"[report_lib] {len(arms)} groups exceed the {len(GROUP_PALETTE)} colour-blind-"
+                   f"checked group colours; {', '.join(arms[len(GROUP_PALETTE):])} get generated "
+                   f"colours (distinct, not CVD-checked). Every group also has its own marker shape, "
+                   f"and line figures split into one panel per group.")
+    palette = GROUP_PALETTE + extra_colors(extra)
+    for i, g in enumerate(arms):
+        out[g] = palette[i]
     return out
+
+
+_WARNED: set = set()
+
+
+def _warn_once(msg):
+    if msg not in _WARNED:
+        _WARNED.add(msg)
+        import sys
+        print(msg, file=sys.stderr)
+
+
+_EXTRA_CACHE: list = []
+
+
+def extra_colors(n):
+    """`n` more group colours, none equal or close to any colour already in use.
+
+    Deterministic greedy farthest-point choice over an HLS grid: each new colour is the candidate
+    (>= 3:1 on both report backgrounds) whose smallest dE to everything already chosen -- the
+    palette, the baseline grey, and the extras before it -- is largest, taking the worst of normal,
+    deuteranopic and protanopic vision. Only reached by projects with more groups than
+    GROUP_PALETTE has slots."""
+    if n <= 0:
+        return []
+    import colorsys
+    while len(_EXTRA_CACHE) < n:
+        used = GROUP_PALETTE + [BASELINE_GREY] + _EXTRA_CACHE
+        best, best_d = None, -1.0
+        for h in range(0, 360, 5):
+            for light in (0.35, 0.42, 0.50, 0.58):
+                for sat in (0.55, 0.75, 0.95):
+                    r, g, b = colorsys.hls_to_rgb(h / 360, light, sat)
+                    c = "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+                    if c in used or min(contrast(c, LIGHT_SURFACE), contrast(c, DARK_SURFACE)) < 3:
+                        continue
+                    d = min(delta_e(c, u, m) for u in used for m in (_NORMAL, _DEUTAN, _PROTAN))
+                    if d > best_d:
+                        best, best_d = c, d
+        _EXTRA_CACHE.append(best)
+    return _EXTRA_CACHE[:n]
+
+
+def intersections(sets):
+    """UpSet counts: every element counted ONCE, under the exact combination of sets it occurs in.
+
+    `sets` = {name: iterable of ids}. Returns [(member_names, n)] largest first (ties: by which sets,
+    in the order of `sets`), members in the order of `sets`. The single definition behind every UpSet
+    view, interactive and static."""
+    names, mask = list(sets), {}
+    for i, n in enumerate(names):
+        bit = 1 << i
+        for x in sets[n]:
+            mask[x] = mask.get(x, 0) | bit
+    counts = {}
+    for m in mask.values():
+        counts[m] = counts.get(m, 0) + 1
+    order = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [(tuple(names[j] for j in range(len(names)) if m >> j & 1), c) for m, c in order]
+
+
+# ------------------------------------------------------------------------------------ plot style
+# ONE object decides how every sample is drawn, on the page (plotly) and in print (matplotlib):
+#
+#   group  -> COLOUR (GROUP_PALETTE, extended past its checked slots) + marker SHAPE
+#   sample -> its group's colour and shape + its own LINE DASH
+#
+# A sample's dash is its POSITION in its group in config order, not its round number. Keying on the
+# round (the old `(round - 1) % 5`) gave two replicates of one round, or rounds 1 and 6, the same
+# (colour, dash). Position-in-group is unique by construction, so (colour, dash) names one sample.
+#
+# Deliberately NOT spent on identity: marker size and line width (they read as magnitude), the
+# open/filled variant (hollow already means "lower bound" / "below min_reads" in several panels), and
+# bar hatching (it already means "raw, depth-dependent" next to a solid rarefied bar).
+#
+# Shapes: every plotly symbol with an exact matplotlib twin, index for index, filled shapes first.
+SHAPES = [("circle", "o"), ("square", "s"), ("diamond", "D"), ("triangle-up", "^"),
+          ("triangle-down", "v"), ("cross", "P"), ("x", "X"), ("triangle-left", "<"),
+          ("triangle-right", ">"), ("pentagon", "p"), ("hexagon", "h"), ("star", "*"),
+          ("octagon", "8"), ("hexagon2", "H"), ("diamond-tall", "d"),
+          ("y-down", "1"), ("y-up", "2"), ("y-left", "3"), ("y-right", "4"),
+          ("cross-thin", "+"), ("x-thin", "x"), ("line-ns", "|"), ("line-ew", "_")]
+# Dashes: on/off lengths in px. Past this list they are generated and never repeat (see Look.dashes).
+DASHES = [(), (6, 3), (10, 3), (6, 2.5, 1.5, 2.5), (2, 2.5), (10, 2.5, 1.5, 2.5), (3, 3),
+          (6, 2.5, 1.5, 2.5, 1.5, 2.5), (14, 3), (10, 2.5, 3, 2.5)]
+BASELINE_DASH = 4                    # the R0 library is dotted -- and the only grey line
+MPL_DASH_SCALE = 0.55                # px on screen -> points at print line widths
+
+
+class Look:
+    """How ONE sample is drawn. `trace()` / `hover()` feed plotly, `mpl()` feeds matplotlib.
+
+    A plain class, NOT a @dataclass: common.smk loads this module with importlib WITHOUT registering
+    it in sys.modules, and dataclasses look the module up there -- the workflow would stop parsing."""
+    __slots__ = ("name", "group", "round", "color", "shape", "dash")
+
+    def __init__(self, name: str, group: str, round: int | None, color: str, shape: int, dash: int):
+        self.name, self.group, self.round = name, group, round
+        self.color, self.shape, self.dash = color, shape, dash
+
+    @property
+    def dashes(self) -> tuple:
+        if self.dash < len(DASHES):
+            return DASHES[self.dash]
+        k = self.dash - len(DASHES)        # a run of dots after a stepped dash, 3.5px gaps
+        return (4 + 2 * (k % 6), 3.5) + (1.5, 3.5) * (1 + k // 6)
+
+    @property
+    def label(self) -> str:
+        """The FULL identity, for hovers: the sample name, then its group and round."""
+        tail = " · ".join(x for x in (self.group, "" if self.round is None else f"R{self.round}") if x)
+        return f"<b>{esc(self.name)}</b>" + (f"<br>{esc(tail)}" if tail else "")
+
+    # ------------------------------------------------------------------ plotly
+    def trace(self, mode="lines", width=1.6, size=7, **marker) -> dict:
+        """Everything a per-sample trace needs: its own legend entry under its group's title, its
+        line, and (for a marker mode) its group's shape. `legendgroup` links a group's entries, so a
+        click on the group title toggles the whole arm."""
+        kw = dict(name=esc(self.name), legendgroup=self.group,
+                  legendgrouptitle_text=esc(self.group), mode=mode)
+        if "lines" in mode:
+            kw["line"] = dict(color=self.color, width=width,
+                              dash=",".join(f"{v:g}px" for v in self.dashes) or "solid")
+        if "markers" in mode:
+            kw["marker"] = dict(color=self.color, size=size, symbol=SHAPES[self.shape][0], **marker)
+        return kw
+
+    def hover(self, body: str) -> str:
+        """A hovertemplate that always leads with the full sample label (never cut short)."""
+        return f"{self.label}<br>{body}<extra></extra>"
+
+    # ------------------------------------------------------------------ matplotlib
+    def mpl(self, lw=0.9, ms=3.4, markers=False) -> dict:
+        ls = "-" if not self.dashes else (0, tuple(round(MPL_DASH_SCALE * v, 2) for v in self.dashes))
+        kw = dict(color=self.color, ls=ls, lw=lw, label=self.name)
+        if markers:
+            kw.update(marker=SHAPES[self.shape][1], ms=ms, mec=self.color)
+        return kw
+
+
+class PlotStyle:
+    """The project's visual encoding, built once from the CONFIG sample table.
+
+    `samples` is a load_meta() dict or a list of sample dicts (`name`, `round`, the group under
+    `key`). Build it from load_meta() when you have it: positions are then taken over the DECLARED
+    samples, so a sample missing from one report cannot shift its group-mates' dashes there.
+
+        style = PlotStyle(meta)
+        fig.add_trace(go.Scatter(x=..., y=..., **style[s].trace(), hovertemplate=style[s].hover("...")))
+        ax.plot(x, y, **style[s].mpl())
+    """
+
+    MAX_LINES = 24       # more curves than this in one panel -> one panel per group
+
+    def __init__(self, samples, key="group"):
+        if isinstance(samples, dict):
+            rows = sorted(({"name": n, **m} for n, m in samples.items()),
+                          key=lambda m: (m.get("idx", 0), m.get("round") or 0))
+            key = "group"
+        else:
+            rows = list(samples)
+        self.key = key
+        self.groups = group_order(rows, key=key)                 # arms, config order
+        self.colors = group_color(self.groups)
+        self.shapes = {BASELINE_GROUP: 0, **{g: i % len(SHAPES) for i, g in enumerate(self.groups)}}
+        seen, self.looks = {}, {}
+        for s in rows:
+            g = str(s.get(key) or "")
+            pos = seen[g] = seen.get(g, -1) + 1
+            self.looks[s["name"]] = Look(
+                name=s["name"], group=g, round=s.get("round"), color=self.colors.get(g, GREY),
+                shape=self.shapes.get(g, 0), dash=BASELINE_DASH if g == BASELINE_GROUP else pos)
+
+    def __getitem__(self, sample) -> Look:
+        """A Look by sample name or sample dict."""
+        return self.looks[sample if isinstance(sample, str) else sample["name"]]
+
+    def __contains__(self, sample) -> bool:
+        return (sample if isinstance(sample, str) else sample["name"]) in self.looks
+
+    def color(self, group) -> str:
+        return self.colors.get(group, GREY)
+
+    def marker(self, group) -> str:
+        """The group's matplotlib marker -- the twin of its plotly symbol."""
+        return SHAPES[self.shapes.get(group, 0)][1]
+
+    def symbol(self, group) -> str:
+        return SHAPES[self.shapes.get(group, 0)][0]
+
+    @classmethod
+    def of(cls, meta, samples, key="group"):
+        """From the config table when it covers every discovered sample, else from the discovered
+        list itself (a standalone run with no metadata TSV)."""
+        if meta and all(s["name"] in meta for s in samples):
+            return cls(meta)
+        return cls(samples, key=key)
+
+    def panels(self, samples) -> list:
+        """[(title, samples)]: ONE panel while it stays readable -- every group on a checked colour
+        and <= MAX_LINES curves -- else one panel per group, each also carrying the R0 baseline."""
+        samples = list(samples)
+        groups = [self[s].group for s in samples]
+        arms = [g for g in dict.fromkeys(groups) if g != BASELINE_GROUP]
+        if len(arms) <= len(GROUP_PALETTE) and len(samples) <= self.MAX_LINES:
+            return [("", samples)]
+        base = [s for s, g in zip(samples, groups) if g == BASELINE_GROUP]
+        return [(a, base + [s for s, g in zip(samples, groups) if g == a]) for a in arms]
+
+    def curves(self, samples, curve, mode="lines", width=1.6, size=7, height=460, gl=False, **marker):
+        """A plotly figure with one trace per sample, each drawn with its Look and its full label on
+        hover, split into one panel per group (2 columns) when one panel would be unreadable.
+
+        `curve(sample)` returns (x, y, hover_body) -- hover_body may use %{x}/%{y} -- or None to
+        leave the sample out. `gl=True` draws WebGL scatter, for point clouds; extra keywords go to
+        every marker (e.g. opacity). The ONLY method here that builds a figure, so plotly is imported
+        lazily: this module must stay importable at workflow-parse time (see the docstring)."""
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        panels = self.panels(samples)
+        cols = 1 if len(panels) == 1 else 2
+        rows = -(-len(panels) // cols)
+        fig = make_subplots(rows=rows, cols=cols, shared_xaxes=True, shared_yaxes=True,
+                            horizontal_spacing=0.06, vertical_spacing=min(0.12, 0.5 / rows),
+                            subplot_titles=[esc(t) for t, _ in panels] if cols > 1 else None)
+        shown = set()
+        for i, (_, members) in enumerate(panels):
+            for s in members:
+                got = curve(s)
+                if not got:
+                    continue
+                lk = self[s]
+                trace = go.Scattergl if gl else go.Scatter
+                fig.add_trace(trace(x=got[0], y=got[1], **lk.trace(mode, width, size, **marker),
+                                    hovertemplate=lk.hover(got[2]),
+                                    showlegend=lk.name not in shown),
+                              row=i // cols + 1, col=i % cols + 1)
+                shown.add(lk.name)
+        fig.update_layout(height=height if rows == 1 else max(height, 300 * rows))
+        return self.layout(fig)
+
+    def upset(self, sets, group, top_n=24, height=460):
+        """UpSet view of ONE selection: `sets` = {sample: ids}, rows in the given order (R0 first, then
+        the rounds). Bars = the top_n EXCLUSIVE intersections (intersections() -- the same counts the
+        static figure draws); the dot matrix names their members; each row label carries its set size,
+        because a shared count only means something next to the sizes it was drawn from."""
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        names, color = list(sets), self.color(group)
+        sizes = {n: len(set(v)) for n, v in sets.items()}
+        inter = intersections(sets)[:top_n]
+        xs, rows = list(range(len(inter))), list(range(len(names)))
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.62, 0.38], vertical_spacing=0.04)
+        fig.add_trace(go.Bar(x=xs, y=[c for _, c in inter], marker_color=color,
+                             customdata=["<br>".join(esc(m) for m in mem) for mem, _ in inter],
+                             hovertemplate="%{y:,} shared by exactly:<br>%{customdata}<extra></extra>"),
+                      row=1, col=1)
+        fig.add_trace(go.Scatter(x=[x for x in xs for _ in rows], y=rows * len(xs), mode="markers",
+                                 marker=dict(color="#e6e6e6", size=9), hoverinfo="skip"), row=2, col=1)
+        for x, (mem, _) in zip(xs, inter):
+            fig.add_trace(go.Scatter(x=[x] * len(mem), y=[names.index(m) for m in mem], mode="markers+lines",
+                                     marker=dict(color=color, size=10), line=dict(color=color, width=2),
+                                     hoverinfo="skip"), row=2, col=1)
+        fig.update_yaxes(title_text="shared", row=1, col=1)
+        fig.update_yaxes(tickmode="array", tickvals=rows, autorange="reversed", row=2, col=1,
+                         ticktext=[f"{esc(n)} ({sizes[n]:,})" for n in names])
+        fig.update_xaxes(showticklabels=False, row=2, col=1)
+        fig.update_layout(showlegend=False, height=height)
+        return self.layout(fig, legend_right=False)
+
+    @staticmethod
+    def layout(fig, legend_right=True):
+        """Report-wide plotly settings: hover boxes never truncate a name (plotly cuts at 15
+        characters by default), and the per-sample legend sits right of the plot, grouped."""
+        fig.update_layout(hoverlabel=dict(namelength=-1))
+        if legend_right:
+            fig.update_layout(legend=dict(orientation="v", x=1.02, xanchor="left", y=1,
+                                          yanchor="top", groupclick="toggleitem",
+                                          tracegroupgap=6, font=dict(size=11)))
+        return fig
 
 
 def group_spans(samples, key="group"):
@@ -365,5 +666,35 @@ if __name__ == "__main__":   # python3 report_lib.py
     assert group_order([{"group": BASELINE_GROUP}, {"group": EMPTY_GROUP}]) == [EMPTY_GROUP], \
         "group_order must drop the baseline BY GROUP NAME and keep the empty arm"
     assert load_meta(None) == {}, "a missing metadata TSV is not an error"
+
+    # ---- loadable the way common.smk loads it: importlib, NOT registered in sys.modules -------
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("report_lib_parse_check", __file__)
+    _spec.loader.exec_module(importlib.util.module_from_spec(_spec))
+
+    # ---- the plot style: (colour, dash) names exactly one sample ----------------------------
+    reps = [{"name": "initial", "group": BASELINE_GROUP, "round": 0}]
+    reps += [{"name": f"A_R{r}_{k}", "group": "A", "round": r} for r in (1, 6) for k in (1, 2)]
+    reps += [{"name": f"B_R{r}", "group": "B", "round": r} for r in range(1, 25)]
+    style = PlotStyle(reps)
+    pairs = [(lk.color, lk.dashes) for lk in style.looks.values()]
+    assert len(set(pairs)) == len(pairs), "two samples share a (colour, dash) pair"
+    assert style["initial"].color == BASELINE_GREY and style["A_R1_1"].color == GROUP_PALETTE[0]
+    assert style["A_R1_1"].trace()["line"]["dash"] == "solid" != style["A_R1_2"].trace()["line"]["dash"]
+    assert style.marker("A") == style["A_R6_2"].mpl(markers=True)["marker"] != style.marker("B"), \
+        "marker shape is the group's second channel: shared within a group, distinct across groups"
+    assert len({Look("x", "g", 1, "#000000", 0, i).dashes for i in range(200)}) == 200, "dashes repeat"
+    assert len({p for p, _ in SHAPES}) == len({m for _, m in SHAPES}) == len(SHAPES), "shape twins drifted"
+    assert len(style.panels(reps)) == 2, "29 curves > MAX_LINES -> one panel per group (A, B)"
+    assert len(style.panels(reps[:5])) == 1
+    assert intersections({"a": [1, 2, 3], "b": [2, 3, 4], "c": [3]}) == \
+        [(("a",), 1), (("b",), 1), (("a", "b"), 1), (("a", "b", "c"), 1)], "exclusive intersections"
+    assert sum(n for _, n in intersections({"a": "xyz", "b": "yzw"})) == 4, "each element counted once"
+    wide = [{"name": f"s{i}", "group": f"g{i}", "round": 1} for i in range(len(GROUP_PALETTE) + 2)]
+    assert len(PlotStyle(wide).panels(wide)) == len(wide), "past the checked palette -> one panel each"
+    for n in (len(GROUP_PALETTE), len(GROUP_PALETTE) + 6):   # within, and past, the palette
+        many = group_color([f"g{i}" for i in range(n)])
+        assert len(set(many.values())) == n + 1, "every group (and the baseline) needs its own colour"
+    assert group_color(["g0"])["g0"] == GROUP_PALETTE[0], "extras must not disturb the palette"
     print("report_lib self-test OK" if good else "report_lib self-test: PALETTE BELOW FLOOR")
     raise SystemExit(0 if good else 1)

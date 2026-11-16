@@ -11,16 +11,10 @@
 # Everything the workflow produces lands under this directory.
 outdir: results
 
-# Opt-in PDF/PNG exports of the workflow's HTML figures to <outdir>/static_plots/.
-# Enable here, or use: pixi run -e snakemake snakemake --static-plot
+# Opt-in print-ready figures in <outdir>/static_plots/: F01-F19 run QC / overlap / agreement figures
+# and Science-style redraws of every HTML report figure (needs fragvec.enabled). Enable here, or
+# add `--config static_plot=true` to the snakemake command.
 static_plot: false
-# Within-batch overlap tables/figures are included when static_plot and fragvec.enabled are true.
-# Clone sampling is without replacement; permutations shuffle sample group labels.
-static_overlap:
-  depths: [5000, 26000, 55000]
-  reps: 20
-  permutations: 500
-  seed: 0
 
 # ---- decontamination genomes (host/contaminant depletion in `clean`) ----------------
 # A read is KEPT only if it is unmapped to EVERY genome listed here (order doesn't change

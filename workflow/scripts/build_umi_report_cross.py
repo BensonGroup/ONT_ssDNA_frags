@@ -59,8 +59,8 @@ from plotly.offline import get_plotlyjs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from report_lib import (
-    BASELINE_GREY, BASELINE_GROUP, GREY, color_key_html, esc, fig_html, first_of_group, group_band,
-    group_color, group_dividers, load_meta,
+    BASELINE_GREY, BASELINE_GROUP, GREY, PlotStyle, color_key_html, esc, fig_html, group_band,
+    group_dividers, intersections, load_meta,
 )
 
 BASE = Path(os.environ.get("L2F_BASE", "")).resolve()
@@ -76,12 +76,15 @@ OUT = BASE / "umi_report_cross.html"
 def style(fig, height, title=None, top=None):
     # `top` reserves extra top margin for a rotated group band (see report_lib.group_band): a
     # rotated label is ~0.7*(width + height) tall and would otherwise collide with the title.
+    # height=None keeps the height PlotStyle.curves chose for its panel grid; a legend it already
+    # placed (one entry per sample, right of the plot) is kept too.
     fig.update_layout(
-        height=height, title=title, template="plotly_white",
+        height=height or fig.layout.height, title=title, template="plotly_white",
         margin=dict(l=60, r=20, t=(top if top else (50 if title else 20)), b=50),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        font=dict(size=12),
+        font=dict(size=12), hoverlabel=dict(namelength=-1),
     )
+    if fig.layout.legend.orientation is None:
+        fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
     return fig
 
 
@@ -279,7 +282,7 @@ def summary_table(samples, summaries, cplx, gcol):
             f"<tbody>{''.join(rows)}</tbody></table></div>")
 
 
-def fig_ceff_trajectory(samples, cplx, collapse, gcol):
+def fig_ceff_trajectory(samples, cplx, collapse, pstyle):
     """C_eff vs selection round, one line per group, all starting from the shared R0 library.
 
     The headline figure of the UMI branch. Log y because the collapse spans orders of magnitude.
@@ -293,6 +296,7 @@ def fig_ceff_trajectory(samples, cplx, collapse, gcol):
     base = next((s for s in samples if s["is_baseline"]), None)
     brow = by_name.get(base["name"]) if base else None
     vs_r0 = collapse_vs_r0(collapse)
+    gcol = pstyle.colors
 
     groups = [g for g in dict.fromkeys(s["group"] for s in samples if not s["is_baseline"])]
     fig = go.Figure()
@@ -310,18 +314,20 @@ def fig_ceff_trajectory(samples, cplx, collapse, gcol):
         lb = [bool(p[1].get("c_eff_is_lower_bound")) for p in pts]
         err = [(p[1]["c_eff"] / math.sqrt(p[1]["dup_pairs"])) if p[1].get("dup_pairs") else 0
                for p in pts]
-        names = [p[1]["name"] for p in pts]
+        labels = [pstyle[p[1]["name"]].label if p[1]["name"] in pstyle else esc(p[1]["name"])
+                  for p in pts]
+        shape = pstyle.symbol(g)        # the group's second channel, beside its colour
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines+markers", name=esc(g), legendgroup=g,
             line=dict(color=gcol.get(g, GREY), width=2.2),
             marker=dict(size=10, color=gcol.get(g, GREY),
-                        symbol=["circle-open" if b else "circle" for b in lb],
+                        symbol=[f"{shape}-open" if b else shape for b in lb],
                         line=dict(width=2, color=gcol.get(g, GREY))),
             error_y=dict(type="data", array=err, visible=True, thickness=1.2, width=4,
                          color=gcol.get(g, GREY)),
-            customdata=list(zip(names, [p[1].get("dup_pairs") or 0 for p in pts], lb)),
+            customdata=list(zip(labels, [p[1].get("dup_pairs") or 0 for p in pts], lb)),
             hovertemplate=("%{customdata[0]}<br>C_eff %{y:,.0f}<br>"
-                           "%{customdata[1]:,} duplicate pairs<extra>" + esc(g) + "</extra>"),
+                           "%{customdata[1]:,} duplicate pairs<extra></extra>"),
         ))
         # The fold-drop, stated at the end of each arm. `vs_r0` is keyed on the collapse-vs-R0 row
         # WHATEVER IT IS CALLED, so the empty arm -- whose only row is `kind: protocol` -- gets its
@@ -545,32 +551,20 @@ def _plot_idx(n, cap=2000):
     return sorted({0, n - 1} | {min(n - 1, int(math.exp(step * i)) - 1) for i in range(cap)})
 
 
-def _round_dash(s):
-    """Rounds WITHIN a group are told apart by dash, not by hue or by a legend entry — the legend
-    names groups (3 entries), not samples (11)."""
-    if s["is_baseline"]:
-        return "dot"
-    return ["solid", "dash", "longdash", "dashdot", "longdashdot"][(s["round"] - 1) % 5]
+def _desc_counts(species, s):
+    return species[s["name"]].sort("n_reads", descending=True)["n_reads"].to_list()
 
 
-def fig_rank_abundance(samples, species, gcol):
-    fig = go.Figure()
-    show = first_of_group(samples)
-    for s, first in zip(samples, show):
-        df = species[s["name"]].sort("n_reads", descending=True)
-        y = df["n_reads"].to_list()
-        if not y:
-            continue
+def fig_rank_abundance(samples, species, pstyle):
+    def curve(s):
+        y = _desc_counts(species, s)
         idx = _plot_idx(len(y))
-        fig.add_trace(go.Scatter(
-            x=[i + 1 for i in idx], y=[y[i] for i in idx], mode="lines", name=esc(s["group"]),
-            legendgroup=s["group"], showlegend=first,
-            line=dict(color=gcol.get(s["group"], GREY), width=1.6, dash=_round_dash(s)),
-            hovertemplate="rank %{x}<br>%{y} reads<extra>" + esc(s["name"]) + "</extra>",
-        ))
-    fig.update_xaxes(type="log", title="UMI species rank")
-    fig.update_yaxes(type="log", title="reads")
-    return fig_html(style(fig, 460, "Rank–abundance (corrected UMI species)"))
+        return ([i + 1 for i in idx], [y[i] for i in idx], "rank %{x}<br>%{y} reads") if y else None
+
+    fig = pstyle.curves(samples, curve)
+    fig.update_xaxes(type="log", title_text="UMI species rank")
+    fig.update_yaxes(type="log", title_text="reads")
+    return fig_html(style(fig, None, "Rank–abundance (corrected UMI species)"))
 
 
 def _d_proportion(counts_desc, frac):
@@ -585,42 +579,40 @@ def _d_proportion(counts_desc, frac):
     return 1.0
 
 
-def fig_complexity(samples, species, gcol):
-    order, d50, d90 = [], [], []
-    lorenz = go.Figure()
-    show = first_of_group(samples)
-    for s, first in zip(samples, show):
-        cd = species[s["name"]].sort("n_reads", descending=True)["n_reads"].to_list()
+def fig_complexity(samples, species, pstyle):
+    counts = {s["name"]: _desc_counts(species, s) for s in samples}
+    order = [s for s in samples if counts[s["name"]]]
+    d50 = [100 * _d_proportion(counts[s["name"]], 0.5) for s in order]
+    d90 = [100 * _d_proportion(counts[s["name"]], 0.9) for s in order]
+
+    def curve(s):
+        cd = counts[s["name"]]
         if not cd:
-            continue
-        order.append(s)
-        d50.append(100 * _d_proportion(cd, 0.5))
-        d90.append(100 * _d_proportion(cd, 0.9))
-        n = len(cd)
-        total = sum(cd)
+            return None
+        n, total = len(cd), sum(cd)
         cum, xs_full, ys_full = 0, [0.0], [0.0]
         for i, c in enumerate(cd, start=1):
             cum += c
             xs_full.append(i / n)
             ys_full.append(cum / total)
         idx = [0] + [i + 1 for i in _plot_idx(n)]  # keep the (0,0) origin + thinned curve
-        lorenz.add_trace(go.Scatter(
-            x=[xs_full[i] for i in idx], y=[ys_full[i] for i in idx], mode="lines",
-            name=esc(s["group"]), legendgroup=s["group"], showlegend=first,
-            line=dict(color=gcol.get(s["group"], GREY), width=1.4, dash=_round_dash(s)),
-            hovertemplate="%{x:.1%} of species<br>%{y:.1%} of reads<extra>"
-                          + esc(s["name"]) + "</extra>",
-        ))
+        return ([xs_full[i] for i in idx], [ys_full[i] for i in idx],
+                "%{x:.1%} of species<br>%{y:.1%} of reads")
+
+    lorenz = pstyle.curves(order, curve, width=1.4)
     lorenz.add_shape(type="line", x0=0, y0=0.5, x1=1, y1=0.5, line=dict(color=GREY, dash="dash", width=1))
     lorenz.add_shape(type="line", x0=0, y0=0.9, x1=1, y1=0.9, line=dict(color=GREY, dash="dash", width=1))
-    lorenz.update_xaxes(title="cumulative fraction of species (ranked by abundance)")
-    lorenz.update_yaxes(title="cumulative fraction of reads")
+    lorenz.update_xaxes(title_text="cumulative fraction of species (ranked by abundance)")
+    lorenz.update_yaxes(title_text="cumulative fraction of reads")
 
     names = [s["name"] for s in order]
-    colors = [gcol.get(s["group"], GREY) for s in order]
+    colors = [pstyle[s].color for s in order]
+    labels = [pstyle[s].label for s in order]
     bars = go.Figure()
-    bars.add_trace(go.Bar(x=names, y=d50, name="D50", marker=dict(color=colors)))
-    bars.add_trace(go.Bar(x=names, y=d90, name="D90",
+    bars.add_trace(go.Bar(x=names, y=d50, name="D50", marker=dict(color=colors), customdata=labels,
+                          hovertemplate="%{customdata}<br>D50 %{y:.2f}%<extra></extra>"))
+    bars.add_trace(go.Bar(x=names, y=d90, name="D90", customdata=labels,
+                          hovertemplate="%{customdata}<br>D90 %{y:.2f}%<extra></extra>",
                           marker=dict(color=colors, opacity=0.4,
                                       pattern=dict(shape="/", solidity=0.35))))
     for x in group_dividers(order):
@@ -629,45 +621,19 @@ def fig_complexity(samples, species, gcol):
     bars.update_yaxes(title="% of distinct species reaching 50% / 90% of reads")
     bars.update_layout(barmode="group")
     return (fig_html(style(bars, 440, "Complexity: D50 / D90 (lower = more concentrated)", top=88))
-            + fig_html(style(lorenz, 460, "Cumulative abundance (Lorenz)")))
+            + fig_html(style(lorenz, None, "Cumulative abundance (Lorenz)")))
 
 
-def fig_upset(group, gsamples, species, color, top_n=24):
-    long = pl.concat([
-        species[nm].select(pl.col("umi").alias("fused_umi")).with_columns(pl.lit(nm).alias("sample"))
-        for nm in gsamples if species[nm].height
-    ]) if any(species[nm].height for nm in gsamples) else None
-    if long is None or long.height == 0:
+def fig_upset(group, gsamples, species, pstyle, top_n=24):
+    """Shared corrected-UMI species across ONE selection's samples (R0 first, then its rounds), drawn
+    by the shared PlotStyle.upset -- the same intersection counts as the static series."""
+    sets = {nm: species[nm]["umi"].to_list() for nm in gsamples if species[nm].height}
+    if not sets:
         return f"<p class='small'>No UMI species for group {esc(group)}.</p>"
-    bitmap = pl.DataFrame({"sample": gsamples, "bitval": [1 << i for i in range(len(gsamples))]})
-    patt = long.join(bitmap, on="sample").group_by("fused_umi").agg(pl.col("bitval").sum().alias("mask"))
-    counts = patt.group_by("mask").agg(pl.len().alias("size")).sort("size", descending=True)
-    masks = []
-    for mask, size in counts.head(top_n).iter_rows():
-        members = [j for j in range(len(gsamples)) if mask & (1 << j)]
-        masks.append((members, size))
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.62, 0.38], vertical_spacing=0.04)
-    xs = list(range(len(masks)))
-    fig.add_trace(go.Bar(x=xs, y=[m[1] for m in masks], marker_color=color,
-                         hovertemplate="%{y} species<extra></extra>"), row=1, col=1)
-    for xi, (members, _sz) in enumerate(masks):
-        # faint dots for all rows, solid for members, connected
-        fig.add_trace(go.Scatter(x=[xi] * len(gsamples), y=list(range(len(gsamples))), mode="markers",
-                                 marker=dict(color="#e6e6e6", size=9), showlegend=False,
-                                 hoverinfo="skip"), row=2, col=1)
-        if members:
-            fig.add_trace(go.Scatter(x=[xi] * len(members), y=members, mode="markers+lines",
-                                     marker=dict(color=color, size=10),
-                                     line=dict(color=color, width=2),
-                                     showlegend=False, hoverinfo="skip"), row=2, col=1)
-    fig.update_yaxes(title="species", row=1, col=1)
-    fig.update_yaxes(tickmode="array", tickvals=list(range(len(gsamples))),
-                     ticktext=[esc(x) for x in gsamples], row=2, col=1, autorange="reversed")
-    fig.update_xaxes(showticklabels=False, row=2, col=1)
-    fig.update_layout(showlegend=False)
-    return fig_html(style(fig, 460,
-                          f"Shared corrected-UMI species across {esc(group)} "
-                          f"(top {len(masks)} intersections)"))
+    fig = pstyle.upset(sets, group, top_n=top_n)
+    n = min(top_n, len(intersections(sets)))
+    return fig_html(style(fig, None, f"Shared corrected-UMI species across {esc(group)} "
+                                     f"(top {n} intersections)"))
 
 
 def _read_signatures(frags_path):
@@ -799,7 +765,8 @@ def main():
     summaries = {s["name"]: load_summary(s) for s in samples}
     cplx = load_table(COMPLEXITY_TSV)
     collapse = load_table(COLLAPSE_TSV)
-    gcol = group_color(samples)
+    pstyle = PlotStyle.of(meta, samples)   # group colour + shape, one dash per sample
+    gcol = pstyle.colors
     if not cplx:
         sys.stderr.write("[warn] no complexity table (L2F_COMPLEXITY); C_eff panels will be empty\n")
 
@@ -814,7 +781,8 @@ def main():
         "<p class='small'>Descriptive QC over corrected UMI species (mode <code>correct</code>). "
         "This is a workflow output — no biological conclusions are drawn. Every figure is coloured "
         "by the config <code>group</code>; the initial library is the shared R0 baseline both arms "
-        "start from, and is drawn grey and dashed throughout.</p>",
+        "start from, and is drawn grey and dotted throughout. Inside a group every sample has its own "
+        "line dash, so colour + dash names exactly one sample.</p>",
         color_key_html(gcol, samples),
         summary_table(samples, summaries, cplx, gcol),
 
@@ -834,7 +802,7 @@ def main():
         "cannot tell you which — so read it next to <code>dup pairs</code>, <code>max nᵢ</code> and "
         "<code>top10 %S</code> below. Lost lineages do not create high-count UMIs; PCR skew and "
         "clonal expansion do.</p>",
-        fig_ceff_trajectory(samples, cplx, collapse, gcol),
+        fig_ceff_trajectory(samples, cplx, collapse, pstyle),
         ceff_table(samples, cplx, collapse, gcol),
         fig_depth_complexity(samples, cplx, gcol),
         # "" when the config declares no `empty` arm -- the join below drops it, and the report
@@ -845,9 +813,10 @@ def main():
         "<p class='small'>⚠ Both panels below are species counts and are therefore <b>depth-sensitive</b>: "
         "the rank-abundance curve's length is the species count, and D50/D90 are proportions over that "
         "same depth-dependent denominator. Read them for shape, not for cross-sample magnitude. Within "
-        "a group, rounds are told apart by line dash.</p>",
-        fig_rank_abundance(samples, species, gcol),
-        fig_complexity(samples, species, gcol),
+        "a group, each sample has its own line dash and its own legend entry; hover any curve for "
+        "its full sample name.</p>",
+        fig_rank_abundance(samples, species, pstyle),
+        fig_complexity(samples, species, pstyle),
         "<h2>Species overlap</h2>",
         "<p class='small'>⚠ Shared-species counts grow with the depth of <b>both</b> samples, so an UpSet "
         "built on unequal depths overstates the overlap of the deeper pair. Rarefaction is not meaningful "
@@ -859,7 +828,7 @@ def main():
     for g in groups:
         gs = ([base_name] if base_name else []) + [s["name"] for s in samples
                                                    if s["group"] == g and not s["is_baseline"]]
-        H.append(fig_upset(g, gs, species, gcol.get(g, GREY)))
+        H.append(fig_upset(g, gs, species, pstyle))
     H += [
         "<h2>Validity QC</h2>",
         fig_purity(samples, gcol),

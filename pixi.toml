@@ -109,11 +109,6 @@ rust = "*"
 [feature.snakemake.dependencies]
 snakemake-minimal = "*"
 
-# Extend the normal Pixi command with workflow options; the launcher calls
-# python -m snakemake, so this task does not invoke itself.
-[feature.snakemake.tasks]
-snakemake = 'python "$PIXI_PROJECT_ROOT/workflow/run.py"'
-
 # ---------------------------------------------------------------------------
 # Environments
 # ---------------------------------------------------------------------------

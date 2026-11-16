@@ -285,8 +285,8 @@ def fig_scatter(d: pl.DataFrame, flagged: pl.DataFrame, ratio_max, robust_cut, m
         x=flagged["n_reads"].to_list(), y=flagged["ratio"].to_list(), mode="markers",
         name="FLAGGED jackpot", marker=dict(size=13, color=FLAG_COLOR, symbol="x",
                                             line=dict(width=1, color=FLAG_COLOR)),
-        customdata=[v[:60] for v in flagged["vector"].to_list()],
-        hovertemplate="reads %{x}<br>ratio %{y:.2f}<br>%{customdata}<extra></extra>"))
+        customdata=[esc(v) for v in flagged["vector"].to_list()],      # the FULL vector
+        hovertemplate="<b>%{customdata}</b><br>reads %{x}<br>ratio %{y:.2f}<extra></extra>"))
     fig.add_hline(y=ratio_max, line=dict(color=FLAG_COLOR, dash="dash"),
                   annotation_text=f"ratio_max = {ratio_max:g} (cited)", annotation_position="top left")
     if robust_cut == robust_cut and math.isfinite(robust_cut):  # not NaN/inf
@@ -335,7 +335,8 @@ def flagged_umi_table(blacklist: pl.DataFrame):
         f"<td class='num'>{r['base_entropy_bits']:.2f}</td>"
         f"<td class='num flag'>{r['ratio']:.2f}</td>"
         f"<td class='num'>{r['dominance']:.3f}</td>"
-        f"<td class='mono'>{esc(r['vector'][:48])}{'…' if len(r['vector'])>48 else ''}</td></tr>"
+        f"<td class='mono' title='{esc(r['vector'])}'>{esc(r['vector'][:48])}"
+        f"{'…' if len(r['vector'])>48 else ''}</td></tr>"
         for r in blacklist.iter_rows(named=True))
     return ("<div style='overflow-x:auto'><table><thead><tr><th>UMI (barcode)</th>"
             "<th>family reads</th><th>homopolymer_maxrun</th><th>n_distinct_bases</th>"

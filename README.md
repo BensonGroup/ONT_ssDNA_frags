@@ -143,6 +143,17 @@ The sample order decides the report color and order:
 - **Keep `samples:` grouped** — one group's rounds contiguous, in ascending round order. Nothing
   re-sorts them for you.
 
+How a sample is drawn, in every HTML report and every static figure (`report_lib.PlotStyle`):
+
+- **group → colour + marker shape.** 8 colour-blind-checked colours; a project with more groups is
+  fine — the extra groups get generated colours (distinct, never reused; a warning is printed) and
+  the marker shape still tells them apart.
+- **sample → its own line dash** inside its group, by its position in `samples:`, so colour + dash
+  names exactly one sample. Each sample has its own legend entry under its group's title, and every
+  hover starts with the full sample name.
+- A figure that would hold more than 24 curves, or more groups than checked colours, splits into one
+  panel per group (the R0 library drawn in each).
+
 ## Key rules/steps
 
 ## Decode coverage filter (`decode_filter`)
@@ -282,6 +293,9 @@ library lives in `umi_initial/`. With `jackpot.enabled: false` it is `umicorr` i
 | `<tree>/<sample>/<sample>.featurecount.parquet` + `.summary.tsv`                                              | per-read feature counts                                                      |
 | `<tree>/<sample>/<sample>.featurecount_report.html`                                                           | per-sample interactive report                                                |
 | `<tree>/cross_sample_featurecount_report.html`                                                                | cross-sample comparison report                                               |
+| `static_plots/analysis/` (`static_plot: true`)                                                                 | **the analysis series**, one PDF per step in run order (01 raw sequencing → 02 read funnel → 03 decode QC → 04 raw fragment calls → 05 UMI QC → 06 fragment quantification → 07 UMI complexity → 08 UMI abundance → 09 UMI sharing across each selection's rounds → 10 fragvec quantification → 11 fragvec trajectories → 12 fragvec sharing across each selection's rounds), each with one message and its data in `tables/`; `analysis_figures.pdf` = all of them; `figure_legends.md` = message, panels and sources |
+| `static_plots/agreement/` (`static_plot: true`)                                                                | figures 13–22, continuing the series: cross-group agreement (UMI overlap, fragvec concordance, detection at matched depth, CLR PCA, complexity dependence) |
+| `static_plots/reports/` (`static_plot: true`)                                                                  | every HTML-report figure redrawn for print (PDF + SVG, `index.html`) |
 
 ## Standalone per-study analyses (`scripts/`, outside the DAG)
 
